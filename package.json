@@ -1,0 +1,58 @@
+{
+  "name": "roblox-cli",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A macOS CLI and authenticated local daemon for driving Roblox Studio.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ilm-Alan/roblox-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Ilm-Alan/roblox-cli/issues"
+  },
+  "homepage": "https://github.com/Ilm-Alan/roblox-cli#readme",
+  "files": [
+    "dist/",
+    "studio-plugin/RobloxCliStudio.rbxmx",
+    "README.md",
+    "LICENSE",
+    "LICENSE.upstream",
+    "PROVENANCE.json"
+  ],
+  "type": "module",
+  "bin": {
+    "roblox": "dist/cli-main.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "clean": "node scripts/clean-build.mjs",
+    "build": "npm run clean && tsc && npm --prefix studio-plugin run build && node scripts/build-plugin.mjs && node scripts/build-native.mjs",
+    "start": "node dist/daemon.js",
+    "build:plugin": "npm --prefix studio-plugin run build && node scripts/build-plugin.mjs",
+    "check:package": "node scripts/check-package.mjs",
+    "test": "jest --runInBand",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "express": "4.22.2",
+    "ws": "8.21.3",
+    "fzstd": "0.1.1",
+    "saxes": "6.0.0"
+  },
+  "overrides": {
+    "qs": "6.16.0"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "@types/node": "20.19.33",
+    "@types/express": "4.17.25",
+    "@types/ws": "8.18.1",
+    "@types/jest": "29.5.14",
+    "jest": "29.7.0",
+    "ts-jest": "29.4.6",
+    "esbuild": "0.27.2"
+  }
+}

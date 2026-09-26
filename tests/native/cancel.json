@@ -1,0 +1,29 @@
+{
+  "resume_when": {
+    "target": "client-1",
+    "code": "return _G.RobloxCliAcceptance ~= nil",
+    "timeout_ms": 3000
+  },
+  "steps": [
+    {
+      "type": "keyboard",
+      "action": "press",
+      "key_code": "P",
+      "target": "client-1"
+    },
+    {
+      "type": "wait",
+      "duration_ms": 10000
+    },
+    {
+      "type": "eval",
+      "target": "client-1",
+      "code": "_G.RobloxCliAcceptance.clicks += 1; return true",
+      "expect": {
+        "target": "client-1",
+        "code": "return _G.RobloxCliAcceptance.clicks == 2",
+        "timeout_ms": 3000
+      }
+    }
+  ]
+}

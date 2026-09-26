@@ -1,0 +1,10 @@
+node_modules/
+.build/
+dist/
+coverage/
+.smoke/
+studio-plugin/node_modules/
+studio-plugin/out/
+studio-plugin/*.rbxmx
+*.log
+.DS_Store

@@ -1,0 +1,12 @@
+{
+  "repository": "https://github.com/Chrrxs/robloxstudio-mcp.git",
+  "commit": "3c8c6331c2f37d81f4189e35de4a39bedc6f5c9d",
+  "version": "3.1.3",
+  "license": "MIT",
+  "role": "Historical source provenance only; never fetched or applied by setup.",
+  "adaptations": [
+    "Imported bridge and plugin source with our reconnect fix.",
+    "Removed MCP SDK, stdio and Streamable HTTP server, inspector entry and npm self-update.",
+    "Own daemon, HTTP command API, version, tests and CLI product contract."
+  ]
+}

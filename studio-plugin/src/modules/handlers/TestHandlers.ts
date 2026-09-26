@@ -1,0 +1,383 @@
+import { HttpService, Players, RunService } from "@rbxts/services";
+import StopPlayMonitor from "../StopPlayMonitor";
+import PluginSession from "../PluginSession";
+import PeerRole from "../PeerRole";
+
+interface StudioTestServiceMultiplayer extends StudioTestService {
+	ExecuteMultiplayerTestAsync(numPlayers: number, testArgs: unknown): unknown;
+	AddPlayers(numPlayers: number): void;
+	CanLeaveTest(): boolean;
+	LeaveTest(): void;
+	EditModeActive: boolean;
+}
+
+const StudioTestService = game.GetService("StudioTestService") as StudioTestServiceMultiplayer;
+
+type SoloPhase = "idle" | "running" | "completed" | "failed";
+
+// Outcome of the latest start_playtest from this edit DataModel. `result` is
+// the value the game passed to StudioTestService:EndTest. Times are Unix
+// seconds. Each start replaces the table, so a late-finishing earlier run
+// (compared by identity) cannot overwrite a newer run's outcome.
+interface SoloOutcome {
+	phase: SoloPhase;
+	mode?: "play" | "run";
+	ok?: boolean;
+	result?: unknown;
+	error?: string;
+	startedAt?: number;
+	completedAt?: number;
+}
+
+let soloOutcome: SoloOutcome = { phase: "idle" };
+
+type MultiplayerPhase = "idle" | "starting" | "running" | "completed" | "failed";
+
+interface MultiplayerSessionState {
+	phase: MultiplayerPhase;
+	testId?: string;
+	numPlayers?: number;
+	testArgs?: unknown;
+	startedAt?: number;
+	completedAt?: number;
+	ok?: boolean;
+	result?: unknown;
+	error?: string;
+}
+
+let multiplayerState: MultiplayerSessionState = { phase: "idle" };
+
+function detectPeerRole(): string {
+	return PeerRole.detect();
+}
+
+function getPlayersSnapshot() {
+	const players = Players.GetPlayers().map((player) => ({
+		name: player.Name,
+		userId: player.UserId,
+		displayName: player.DisplayName,
+	}));
+	players.sort((a, b) => a.name < b.name);
+	return players;
+}
+
+function cloneMultiplayerState(): MultiplayerSessionState {
+	return {
+		phase: multiplayerState.phase,
+		testId: multiplayerState.testId,
+		numPlayers: multiplayerState.numPlayers,
+		testArgs: multiplayerState.testArgs,
+		startedAt: multiplayerState.startedAt,
+		completedAt: multiplayerState.completedAt,
+		ok: multiplayerState.ok,
+		result: multiplayerState.result,
+		error: multiplayerState.error,
+	};
+}
+
+function normalizeNumPlayers(value: unknown): number | undefined {
+	if (!typeIs(value, "number")) return undefined;
+	const n = math.floor(value);
+	if (n !== value || n < 1 || n > 8) return undefined;
+	return n;
+}
+
+function startPlaytest(requestData: Record<string, unknown>) {
+	const mode = requestData.mode as string | undefined;
+	const numPlayers = requestData.numPlayers as number | undefined;
+
+	if (mode !== "play" && mode !== "run") {
+		return { error: 'mode must be "play" or "run"' };
+	}
+
+	if (numPlayers !== undefined) {
+		return { error: "start_playtest is single-player only. Use multiplayer_test_start for multi-client StudioTestService sessions." };
+	}
+
+	// Peer teardown and ExecutePlayModeAsync completion can precede native edit
+	// readiness. Do not acknowledge a new start that the engine cannot execute.
+	if (!StudioTestService.EditModeActive) {
+		if (soloOutcome.phase === "running") {
+			return { error: "A test is already running" };
+		}
+		return {
+			success: false,
+			error: "Studio is not ready to start a playtest.",
+			message: "Wait for Studio to finish its current playtest transition before starting another.",
+			editModeReady: false,
+		};
+	}
+
+	// EditModeActive means no playtest is running natively. A "running" outcome
+	// here belongs to a run whose ExecutePlayModeAsync task has not resumed
+	// yet (or never will); the new outcome table supersedes it.
+	const outcome: SoloOutcome = { phase: "running", mode, startedAt: DateTime.now().UnixTimestampMillis / 1000 };
+	soloOutcome = outcome;
+	const topologyMarkerToken = PluginSession.prepareSharedTopology();
+
+	task.spawn(() => {
+		const [ok, result] = pcall(() => {
+			if (mode === "play") {
+				return StudioTestService.ExecutePlayModeAsync({});
+			}
+			return StudioTestService.ExecuteRunModeAsync({});
+		});
+		PluginSession.clearTopologyMarker(topologyMarkerToken);
+
+		if (!ok) {
+			warn(`[roblox-cli] Playtest ended with error: ${result}`);
+		}
+		if (soloOutcome !== outcome) return;
+		outcome.completedAt = DateTime.now().UnixTimestampMillis / 1000;
+		outcome.ok = ok;
+		outcome.phase = ok ? "completed" : "failed";
+		outcome.result = ok ? result : undefined;
+		outcome.error = ok ? undefined : tostring(result);
+	});
+
+	const response: Record<string, unknown> = {
+		success: true,
+		message: `Playtest started in ${mode} mode.`,
+	};
+
+	return response;
+}
+
+function stopPlaytest(_requestData: Record<string, unknown>) {
+	// Signal the play-server DM's StopPlayMonitor via plugin:SetSetting.
+	// The monitor acknowledges with the matching request id only after its
+	// StudioTestService:EndTest call returns from pcall.
+	const stopRequest = StopPlayMonitor.requestStop();
+	if (!stopRequest.ok || stopRequest.requestId === undefined) {
+		return { error: "Plugin not ready. Try again in a moment." };
+	}
+	const consumption = StopPlayMonitor.waitForConsumption(stopRequest.requestId);
+	if (!consumption.ok) {
+		// Two distinct failure modes collapse here, distinguished by whether
+		// THIS edit DM has a playtest tracked:
+		//
+		// - no solo run in phase "running": no playtest was running from this
+		//   edit DM (true negative). Return "no active playtest" — fine to retry
+		//   only after actually starting a playtest.
+		// - a solo run is "running": a playtest IS running but the cross-DM signal
+		//   didn't propagate within the consumption timeout (false negative
+		//   from the caller's perspective — playtest may actually have ended).
+		//   Tell the caller it's a timing issue and they can retry.
+		//
+		// Either way clean up the pending request so a future playtest's monitor
+		// doesn't fire EndTest on startup against a stale signal.
+		StopPlayMonitor.clearPending(stopRequest.requestId);
+		if (soloOutcome.phase === "running") {
+			return {
+				error:
+					"Playtest stop signal failed or was not acknowledged. " +
+					"The playtest may have ended anyway; check get_connected_instances.",
+				detail: consumption.error,
+			};
+		}
+		if (consumption.consumed) {
+			return { error: "Playtest stop request reached the play server, but EndTest failed.", detail: consumption.error };
+		}
+		return { error: "No active playtest to stop.", detail: consumption.error };
+	}
+	StopPlayMonitor.clearPending(stopRequest.requestId);
+	// EndTest consumption, task completion, and native edit readiness are distinct
+	// milestones. In particular, the solo run can complete before Studio accepts
+	// another ExecutePlayModeAsync call (and is never tracked for manually
+	// started playtests). Only report completion after both tracked execution
+	// and native teardown settle.
+	const deadline = tick() + 10;
+	while ((soloOutcome.phase === "running" || !StudioTestService.EditModeActive) && tick() < deadline) {
+		task.wait(0.1);
+	}
+	const editModeReady = StudioTestService.EditModeActive;
+	const playtestTaskPending = soloOutcome.phase === "running";
+	if (playtestTaskPending || !editModeReady) {
+		return {
+			success: false,
+			error: "Playtest teardown did not complete.",
+			message: "Stop signal was accepted, but Studio teardown did not settle before timeout.",
+			stopSignalAccepted: true,
+			editModeReady,
+			playtestTaskPending,
+			timedOut: true,
+		};
+	}
+	return { success: true, message: "Playtest stopped." };
+}
+
+function multiplayerTestStart(requestData: Record<string, unknown>) {
+	if (RunService.IsRunning()) {
+		return { error: "multiplayer_test_start must be called on the edit DataModel. Route with target=edit." };
+	}
+
+	const numPlayers = normalizeNumPlayers(requestData.numPlayers);
+	if (numPlayers === undefined) {
+		return { error: "numPlayers must be an integer from 1 to 8" };
+	}
+
+	if (multiplayerState.phase === "starting" || multiplayerState.phase === "running") {
+		return {
+			error: "A multiplayer Studio test is already running",
+			state: cloneMultiplayerState(),
+		};
+	}
+
+	const testArgs = requestData.testArgs !== undefined ? requestData.testArgs : {};
+	const testId = HttpService.GenerateGUID(false);
+
+	multiplayerState = {
+		phase: "starting",
+		testId,
+		numPlayers,
+		testArgs,
+		startedAt: tick(),
+	};
+	const topologyMarkerToken = PluginSession.prepareMultiplayerTopology(testId);
+
+	task.spawn(() => {
+		multiplayerState.phase = "running";
+		const [ok, result] = pcall(() => {
+			return StudioTestService.ExecuteMultiplayerTestAsync(numPlayers, testArgs);
+		});
+		PluginSession.clearTopologyMarker(topologyMarkerToken);
+
+		multiplayerState.completedAt = tick();
+		multiplayerState.ok = ok;
+		if (ok) {
+			multiplayerState.phase = "completed";
+			multiplayerState.result = result;
+			multiplayerState.error = undefined;
+		} else {
+			multiplayerState.phase = "failed";
+			multiplayerState.result = undefined;
+			multiplayerState.error = tostring(result);
+		}
+	});
+
+	const response: Record<string, unknown> = {
+		success: true,
+		message: `Multiplayer Studio test starting with ${numPlayers} player(s).`,
+		testId,
+		phase: multiplayerState.phase,
+		numPlayers,
+		testArgs,
+	};
+	return response;
+}
+
+function multiplayerTestState(_requestData: Record<string, unknown>) {
+	const peer = detectPeerRole();
+	const response: Record<string, unknown> = {
+		success: true,
+		peer,
+		isRunning: RunService.IsRunning(),
+		isRunMode: RunService.IsRunMode(),
+		editModeActive: StudioTestService.EditModeActive,
+	};
+
+	if (peer === "edit") {
+		response.session = cloneMultiplayerState();
+		response.soloOutcome = soloOutcome;
+		return response;
+	}
+
+	const [argsOk, args] = pcall(() => StudioTestService.GetTestArgs());
+	response.testArgsOk = argsOk;
+	response.testArgs = argsOk ? args : undefined;
+	if (!argsOk) response.testArgsError = tostring(args);
+
+	const players = getPlayersSnapshot();
+	response.players = players;
+	response.playerCount = players.size();
+
+	if (peer === "client") {
+		response.localPlayer = Players.LocalPlayer ? Players.LocalPlayer.Name : undefined;
+		const [canLeaveOk, canLeave] = pcall(() => StudioTestService.CanLeaveTest());
+		response.canLeaveOk = canLeaveOk;
+		response.canLeave = canLeaveOk ? canLeave : false;
+		if (!canLeaveOk) response.canLeaveError = tostring(canLeave);
+	}
+
+	return response;
+}
+
+function multiplayerTestAddPlayers(requestData: Record<string, unknown>) {
+	if (!RunService.IsRunning() || !RunService.IsServer()) {
+		return { error: "multiplayer_test_add_players must be called on the running server peer. Route with target=server." };
+	}
+	const numPlayers = normalizeNumPlayers(requestData.numPlayers);
+	if (numPlayers === undefined) {
+		return { error: "numPlayers must be an integer from 1 to 8" };
+	}
+
+	const before = Players.GetPlayers().size();
+	const [ok, result] = pcall(() => StudioTestService.AddPlayers(numPlayers));
+	if (!ok) {
+		return { error: tostring(result) };
+	}
+
+	const deadline = tick() + ((requestData.timeout as number | undefined) ?? 10);
+	while (Players.GetPlayers().size() < before + numPlayers && tick() < deadline) {
+		task.wait(0.1);
+	}
+
+	const players = getPlayersSnapshot();
+	return {
+		success: true,
+		message: `Requested ${numPlayers} additional player(s).`,
+		playerCount: players.size(),
+		players,
+	};
+}
+
+function multiplayerTestLeaveClient(_requestData: Record<string, unknown>) {
+	if (!RunService.IsRunning() || RunService.IsServer()) {
+		return { error: "multiplayer_test_leave_client must be called on a running client peer. Route with target=client-N." };
+	}
+
+	const [canLeaveOk, canLeave] = pcall(() => StudioTestService.CanLeaveTest());
+	if (!canLeaveOk) {
+		return { error: tostring(canLeave), canLeaveOk: false };
+	}
+	if (!canLeave) {
+		return { error: "This client cannot leave the current test session.", canLeaveOk: true, canLeave: false };
+	}
+
+	const localPlayer = Players.LocalPlayer ? Players.LocalPlayer.Name : undefined;
+	task.defer(() => {
+		pcall(() => StudioTestService.LeaveTest());
+	});
+	return {
+		success: true,
+		message: "Client leave requested.",
+		localPlayer,
+	};
+}
+
+function multiplayerTestEnd(requestData: Record<string, unknown>) {
+	if (!RunService.IsRunning() || !RunService.IsServer()) {
+		return { error: "multiplayer_test_end must be called on the running server peer. Route with target=server." };
+	}
+
+	const value = requestData.value !== undefined ? requestData.value : "ended_by_studio_agent";
+	const [ok, result] = pcall(() => StudioTestService.EndTest(value));
+	if (!ok) {
+		return { error: tostring(result) };
+	}
+	return {
+		success: true,
+		message: "Multiplayer Studio test end requested.",
+		value,
+	};
+}
+
+export = {
+	startPlaytest,
+	stopPlaytest,
+	multiplayerTestStart,
+	multiplayerTestState,
+	multiplayerTestAddPlayers,
+	multiplayerTestLeaveClient,
+	multiplayerTestEnd,
+};

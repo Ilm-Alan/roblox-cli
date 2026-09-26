@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "description": "Temporary fixture only; run setup.luau first and cleanup.luau afterwards.",
+  "resume_when": {
+    "target": "client-1",
+    "code": "return _G.RobloxCliAcceptance ~= nil",
+    "timeout_ms": 3000
+  },
+  "steps": [
+    {
+      "name": "gui",
+      "type": "click_gui",
+      "path": [
+        "RobloxCliAcceptance",
+        "Increment"
+      ],
+      "expect": {
+        "target": "client-1",
+        "code": "return _G.RobloxCliAcceptance.clicks == 1",
+        "timeout_ms": 3000
+      }
+    },
+    {
+      "name": "world",
+      "type": "click_world",
+      "path": [
+        "Workspace",
+        "RobloxCliAcceptance",
+        "Target"
+      ],
+      "expect": {
+        "target": "client-1",
+        "code": "return _G.RobloxCliAcceptance.world == 1",
+        "timeout_ms": 3000
+      }
+    },
+    {
+      "name": "show prompt",
+      "type": "eval",
+      "target": "client-1",
+      "code": "workspace.RobloxCliAcceptance.Target.Prompt.Enabled = true; task.wait(.3); return true"
+    },
+    {
+      "name": "prompt",
+      "type": "interact_prompt",
+      "path": [
+        "Workspace",
+        "RobloxCliAcceptance",
+        "Target",
+        "Prompt"
+      ],
+      "expect": {
+        "target": "client-1",
+        "code": "return _G.RobloxCliAcceptance.prompts == 1",
+        "timeout_ms": 3000
+      },
+      "gui_path": [
+        "ProximityPrompts",
+        "Prompt"
+      ]
+    },
+    {
+      "name": "capture",
+      "type": "screenshot",
+      "backend": "native",
+      "crop": "viewport"
+    },
+    {
+      "name": "frame sample",
+      "type": "diagnose",
+      "checks": [
+        "performance",
+        "readiness",
+        "counts"
+      ],
+      "duration_ms": 1000
+    }
+  ]
+}
