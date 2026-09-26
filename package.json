@@ -29,7 +29,7 @@
   },
   "scripts": {
     "clean": "node scripts/clean-build.mjs",
-    "build": "npm run clean && tsc && npm --prefix studio-plugin run build && node scripts/build-plugin.mjs && node scripts/build-native.mjs",
+    "build": "npm run clean && tsc && node scripts/mark-bin-executable.mjs && npm --prefix studio-plugin run build && node scripts/build-plugin.mjs && node scripts/build-native.mjs",
     "start": "node dist/daemon.js",
     "build:plugin": "npm --prefix studio-plugin run build && node scripts/build-plugin.mjs",
     "check:package": "node scripts/check-package.mjs",
