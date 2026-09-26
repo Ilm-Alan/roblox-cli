@@ -13,7 +13,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { resolveAuthToken } from './auth.js';
 import { CliCommandError } from './cli-errors.js';
 import {
-  assertMacOS,
+  assertSupportedPlatform,
   daemonStatus,
   daemonEntry,
   isConnectionRefused,
@@ -1247,7 +1247,7 @@ async function localCommand(parsed: ParsedCli): Promise<{ code: number; response
       }
     }
     if (parsed.command === 'doctor') {
-      assertMacOS();
+      assertSupportedPlatform();
       const checks: JsonObject = { platform: process.platform, node: process.version, data_directory: dataDirectory() };
       try { checks.artifacts = verifyBuildArtifacts(); } catch (error) { checks.artifacts = { ok: false, error: error instanceof Error ? error.message : String(error) }; }
       try { checks.daemon = await daemonStatus(options.port); } catch (error) { checks.daemon = { ok: false, error: error instanceof Error ? error.message : String(error) }; }

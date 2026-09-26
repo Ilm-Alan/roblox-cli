@@ -7,6 +7,9 @@ import { packageRoot } from './daemon-control.js';
 import { captureNativeStudioWindow, type NativeScreenCapture } from './native-screen-capture.js';
 import { activeRecording, RECORDER_ACK_TIMEOUT_MS, spawnRecorder, type StartRecordingRequest } from './native-recording.js';
 const socket = () => join(dataDirectory(), 'capture.sock');
+/** Native window capture, viewport calibration and recording use macOS
+ * ScreenCaptureKit; elsewhere screenshots come from engine capture. */
+export const NATIVE_CAPTURE_MACOS_ONLY = 'Native window capture, viewport cropping and recording are macOS-only; on Windows, screenshots use engine capture (the default backend).';
 const RECORDING_ROUTE = '/record';
 /** Whether a terminal-owned worker is reachable. The daemon must never create
  * one: a worker spawned by the daemon inherits the Screen Recording permission
@@ -79,6 +82,8 @@ export async function captureWithWorker(format?: 'png' | 'jpeg', quality?: numbe
   placeName?: string;
   pid?: number;
 }): Promise<NativeScreenCapture> {
+  if (process.platform !== 'darwin')
+    throw new Error(NATIVE_CAPTURE_MACOS_ONLY);
   if (!existsSync(socket()))
     throw new Error('The terminal-owned capture worker is not running, so a native capture here would have no Screen Recording permission. Run the command from an interactive terminal, which starts the worker.');
   return await call({ format, quality, identity }) as NativeScreenCapture;
@@ -92,6 +97,8 @@ export async function captureWithWorker(format?: 'png' | 'jpeg', quality?: numbe
  * recording therefore goes through the worker, exactly like screenshot capture.
  */
 export async function recordWithWorker(request: StartRecordingRequest & { window: { id: number; pid: number } }): Promise<Record<string, unknown>> {
+  if (process.platform !== 'darwin')
+    throw new Error(NATIVE_CAPTURE_MACOS_ONLY);
   if (!existsSync(socket()))
     throw new Error('The terminal-owned capture worker is not running, so a recording started here would have no Screen Recording permission. Run one screenshot or the playtest from an interactive terminal first.');
   return await call(request, RECORDING_ROUTE) as unknown as Record<string, unknown>;

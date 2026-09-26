@@ -12,7 +12,7 @@ import {
   persistedStateKey,
 } from './managed-instance-registry.js';
 import { packageRoot } from './daemon-control.js';
-import { dataDirectory } from './paths.js';
+import { dataDirectory, windowsLocalAppData } from './paths.js';
 
 export type StudioLaunchSource = 'baseplate' | 'local_file' | 'published_place' | 'place_revision';
 
@@ -132,7 +132,7 @@ export interface StudioInstanceManagerOptions {
 }
 
 export interface StudioLifecycleCapabilities {
-  hostPlatform: 'macos';
+  hostPlatform: 'macos' | 'windows';
   launcher: 'built-in' | 'custom-adapter';
 }
 
@@ -140,6 +140,7 @@ export type ManagedStudioCloseResult =
   | { status: 'closed'; launchId?: string; instanceId?: string }
   | { status: 'already_closed'; launchId?: string; instanceId?: string }
   | { status: 'not_found'; launchId?: string; instanceId?: string };
+
 
 const execFileAsync = promisify(execFile);
 
@@ -149,9 +150,45 @@ async function runAsync(command: string, args: string[], options: Record<string,
     maxBuffer: 4 * 1024 * 1024,
     timeout: 15_000,
     killSignal: 'SIGKILL',
+    windowsHide: true,
     ...options,
   });
   return String(result.stdout).trim();
+}
+
+const POWERSHELL_COMMAND = ['-NoProfile', '-NonInteractive', '-Command'];
+
+// Get-Process exposes the window title and creation time. The creation FILETIME
+// is the process identity that close verifies before stopping anything. The
+// command line (Win32_Process, queried only when Studio runs) lets a launch
+// follow Studio's self-update relaunch.
+const WINDOWS_STUDIO_PROCESS_QUERY = [
+  "$ErrorActionPreference = 'Stop'",
+  // Get-Process reports a missing name as an error, not a successful empty set.
+  '$studio = @(); try { $studio = @(Get-Process RobloxStudioBeta -ErrorAction Stop) } catch { if ($_.FullyQualifiedErrorId -notlike "NoProcessFoundForGivenName,*") { throw } }',
+  '$commandLines = @{}; if ($studio.Count -gt 0) { Get-CimInstance Win32_Process -Filter "Name = \'RobloxStudioBeta.exe\'" | ForEach-Object { $commandLines[[int]$_.ProcessId] = [string]$_.CommandLine } }',
+  '$processes = @($studio | ForEach-Object { [PSCustomObject]@{ Id = $_.Id; Name = $_.Name; Path = [string]$_.Path; ' +
+    'MainWindowTitle = [string]$_.MainWindowTitle; CommandLine = [string]$commandLines[[int]$_.Id]; ' +
+    'StartTimeUtcFileTime = $_.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() } })',
+  'ConvertTo-Json -InputObject $processes -Compress',
+].join('; ');
+
+function parseWindowsStudioProcesses(output: string): StudioProcessInfo[] {
+  const parsed: unknown = JSON.parse(output);
+  const processes: unknown[] = Array.isArray(parsed) ? parsed : [parsed];
+  if (!processes.every((value): value is StudioProcessInfo =>
+    value !== null && typeof value === 'object' &&
+    'Id' in value && typeof value.Id === 'number' && Number.isSafeInteger(value.Id) && value.Id > 0 &&
+    'Name' in value && typeof value.Name === 'string' &&
+    'Path' in value && typeof value.Path === 'string' &&
+    'MainWindowTitle' in value && typeof value.MainWindowTitle === 'string' &&
+    'CommandLine' in value && typeof value.CommandLine === 'string' &&
+    'StartTimeUtcFileTime' in value && typeof value.StartTimeUtcFileTime === 'string' &&
+    /^[1-9]\d*$/u.test(value.StartTimeUtcFileTime)
+  )) {
+    throw new Error('Malformed Roblox Studio process enumeration result.');
+  }
+  return processes;
 }
 
 const ENVIRONMENT_VARIABLE_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/u;
@@ -229,11 +266,27 @@ function resolveStudioExeFromEnvironment(): string | undefined {
 }
 
 export function resolveStudioExe(): string {
+  if (process.platform === 'win32') return resolveStudioExeFromEnvironment() ?? newestWindowsStudioExe();
   if (process.platform !== 'darwin') {
-    throw new Error('roblox-cli supports Studio lifecycle control on macOS only.');
+    throw new Error('roblox-cli supports Studio lifecycle control on macOS and Windows only.');
   }
   return resolveStudioExeFromEnvironment()
     ?? '/Applications/RobloxStudio.app/Contents/MacOS/RobloxStudio';
+}
+
+/** Studio installs per user under %LOCALAPPDATA%\Roblox\Versions; the newest install is current. */
+function newestWindowsStudioExe(): string {
+  const root = path.join(windowsLocalAppData(), 'Roblox', 'Versions');
+  const candidates = existsSync(root)
+    ? readdirSync(root)
+      .filter((name) => name.startsWith('version-'))
+      .map((name) => path.join(root, name, 'RobloxStudioBeta.exe'))
+      .filter((candidate) => existsSync(candidate))
+    : [];
+  if (candidates.length === 0) {
+    throw new Error(`RobloxStudioBeta.exe was not found under ${root}. Install Roblox Studio or set ROBLOX_CLI_STUDIO_EXE.`);
+  }
+  return candidates.sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs)[0];
 }
 
 async function resolveStudioExeAsync(): Promise<string> {
@@ -270,8 +323,17 @@ export function parseStudioProcessLine(line: string): StudioProcessInfo | undefi
   };
 }
 
+
 export async function observeStudioProcesses(): Promise<StudioProcessSnapshot> {
   const observedAt = Date.now();
+  if (process.platform === 'win32') {
+    try {
+      const output = await runAsync('powershell.exe', [...POWERSHELL_COMMAND, WINDOWS_STUDIO_PROCESS_QUERY]);
+      return { status: 'ok', observedAt, processes: parseWindowsStudioProcesses(output) };
+    } catch (error) {
+      return { status: 'error', observedAt, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
   if (process.platform !== 'darwin') return { status: 'ok', observedAt, processes: [] };
   try {
     const output = await runAsync('/bin/ps', ['-axo', 'pid=,lstart=,command='], {
@@ -297,12 +359,15 @@ export async function observeStudioProcesses(): Promise<StudioProcessSnapshot> {
 let bootId: Promise<string> | undefined;
 
 /**
- * The macOS boot session UUID. Unlike kern.boottime it does not change with
- * the time zone or when the wall clock is stepped, and it cannot change while
- * this process runs, so it is read once.
+ * Identity of the current boot. It cannot change while this process runs, so it
+ * is read once: the macOS boot session UUID (unlike kern.boottime it ignores time
+ * zone and clock steps), or Windows' LastBootUpTime.
  */
-function currentBootId(): Promise<string> {
-  bootId ??= runAsync('/usr/sbin/sysctl', ['-n', 'kern.bootsessionuuid'])
+export function currentBootId(): Promise<string> {
+  bootId ??= (process.platform === 'win32'
+    ? runAsync('powershell.exe', [...POWERSHELL_COMMAND,
+      '(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString("o")'])
+    : runAsync('/usr/sbin/sysctl', ['-n', 'kern.bootsessionuuid']))
     .catch(() => `${process.platform}:${process.pid}:unknown-boot`);
   return bootId;
 }
@@ -468,7 +533,7 @@ export class StudioInstanceManager {
 
   getLifecycleCapabilities(): StudioLifecycleCapabilities {
     return {
-      hostPlatform: 'macos',
+      hostPlatform: process.platform === 'win32' ? 'windows' : 'macos',
       launcher: this.processAdapter.spawnStudio ? 'custom-adapter' : 'built-in',
     };
   }

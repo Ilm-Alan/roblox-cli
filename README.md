@@ -1,8 +1,8 @@
 # roblox-cli
 
-`roblox-cli` is a developer-first, macOS-only command line for driving live
-Roblox Studio. It keeps a persistent TypeScript daemon and a generated Luau
-plugin, so each command is a small authenticated request rather than a new
+`roblox-cli` is a developer-first command line for driving live Roblox Studio
+on macOS and Windows. It keeps a persistent TypeScript daemon and a generated
+Luau plugin, so each command is a small authenticated request rather than a new
 MCP session or a new Studio connection.
 
 The public workflow is intentionally small:
@@ -62,7 +62,8 @@ stopped by such a wait reports it as `failure.reason`.
 ## Install from this developer package
 
 Requirements: macOS, Node.js 22+, Roblox Studio, and Apple's Command Line Tools
-(Swift and the macOS SDK, used for native builds and window inspection).
+(Swift and the macOS SDK, used for native builds and window inspection). On
+Windows, see [Windows (PowerShell)](#windows-powershell).
 
 The npm package is not published to a registry; the package metadata supports
 local builds and `npm link`.
@@ -99,6 +100,59 @@ login and restarts it after `stop`. Remove it once:
 launchctl bootout "gui/$(id -u)/com.roblox.cli.daemon"
 rm ~/Library/LaunchAgents/com.roblox.cli.daemon.plist
 ```
+
+## Windows (PowerShell)
+
+The same package runs on Windows: the Node CLI, daemon, agent protocol, and
+generated Studio plugin are shared, and only the host integration (paths,
+Studio discovery, capture) differs. CI builds, tests, and smoke-runs it on
+`windows-latest` on every push, so Windows cannot drift from macOS.
+
+Requirements: Windows 10 or 11, Node.js 22+, Git, and Roblox Studio. PowerShell
+7.3+ is recommended.
+
+```powershell
+git clone https://github.com/Ilm-Alan/roblox-cli.git
+cd roblox-cli
+npm ci
+npm --prefix studio-plugin ci
+npm run build
+npm link
+roblox setup
+roblox daemon start
+```
+
+If PowerShell refuses to run `roblox` because running scripts is disabled,
+allow local scripts once with `Set-ExecutionPolicy -Scope CurrentUser
+RemoteSigned`, or call `roblox.cmd`.
+
+`setup` installs the plugin into `%LOCALAPPDATA%\Roblox\Plugins`; restart
+Studio once after the first install. `roblox open` launches the newest
+`%LOCALAPPDATA%\Roblox\Versions\version-*\RobloxStudioBeta.exe`, or
+`ROBLOX_CLI_STUDIO_EXE`. State, the auth token, and durable jobs live in
+`%LOCALAPPDATA%\roblox-cli\`; daemon logs live in
+`%LOCALAPPDATA%\roblox-cli\logs\`. `daemon start` runs the daemon without a
+console window, and nothing starts it at login.
+
+Before PowerShell 7.3, PowerShell strips embedded double quotes from arguments
+to native programs. Quote Luau strings with single quotes inside a
+double-quoted PowerShell string, or pass a file:
+
+```powershell
+roblox eval "return game:GetService('Workspace'):GetFullName()"
+roblox eval --file scripts\check.luau --target server
+```
+
+Differences from macOS:
+
+- Screenshots use engine capture. The native window backend,
+  `--crop viewport`, and `test calibrate` require macOS.
+- `record`, `record-studio`, and `test play --record` require macOS 15+.
+- The CLI never activates Studio, so `--foreground` (the macOS opt-in for
+  full-rate video) is refused. Input is engine-side virtual input as on macOS;
+  keep the Studio window in front for full render rate, and let `expect`
+  conditions prove each effect.
+- `roblox close` terminates a managed Studio process immediately; save first.
 
 ## Agent protocol
 

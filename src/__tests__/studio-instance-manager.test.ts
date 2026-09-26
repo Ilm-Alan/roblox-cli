@@ -12,7 +12,7 @@ import {
 function managedRecord(instanceId: string, closedAt?: number) {
   return {
     version: 1 as const,
-    recordId: `record-${instanceId}`,
+    recordId: `record-${instanceId.replaceAll(':', '-')}`, // Record files must be valid Windows names.
     instanceId,
     source: 'local_file',
     nativeProcessId: 4242,
@@ -291,7 +291,7 @@ describe('managed instance registry', () => {
   test('an observation that changes nothing but timestamps does not rewrite the record', async () => {
     const registry = new ManagedInstanceRegistry(registryDir);
     await registry.upsert({ ...managedRecord('instance:live'), state: 'connected', processObservationStatus: 'running' });
-    const file = join(registryDir, 'record-instance:live.json');
+    const file = join(registryDir, 'record-instance-live.json');
     const sweep = (observation: { status: 'running'; observedAt: number } | { status: 'unknown'; observedAt: number; error: string }) =>
       registry.sweep({ currentBootId: 'test-boot', observeProcess: () => observation });
 

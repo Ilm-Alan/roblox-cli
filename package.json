@@ -2,16 +2,16 @@
   "name": "roblox-cli",
   "version": "0.1.0",
   "private": true,
-  "description": "A macOS CLI and authenticated local daemon for driving Roblox Studio.",
+  "description": "A macOS and Windows CLI and authenticated local daemon for driving Roblox Studio.",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Ilm-Alan/roblox-cli.git"
+    "url": "git+https://github.com/Ilm-Alan/roblox-cli-windows.git"
   },
   "bugs": {
-    "url": "https://github.com/Ilm-Alan/roblox-cli/issues"
+    "url": "https://github.com/Ilm-Alan/roblox-cli-windows/issues"
   },
-  "homepage": "https://github.com/Ilm-Alan/roblox-cli#readme",
+  "homepage": "https://github.com/Ilm-Alan/roblox-cli-windows#readme",
   "files": [
     "dist/",
     "studio-plugin/RobloxCliStudio.rbxmx",

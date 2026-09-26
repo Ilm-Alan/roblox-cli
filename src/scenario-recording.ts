@@ -97,10 +97,13 @@ export async function startScenarioRecording(
   // creating one from this process would produce exactly the capture denial
   // this route exists to avoid. The invoking CLI already ensured a
   // terminal-owned worker; this only checks that one is there.
+  // No capture worker exists on Windows, so this is also where Windows refuses.
   if (!activeWorkerSocket())
     throw new CliCommandError(
       'recording_unavailable',
-      'No terminal-owned capture worker is running, so a playtest started here cannot record: Screen Recording permission belongs to the terminal, not to the daemon. Run one screenshot or the playtest from an interactive terminal first.',
+      process.platform === 'darwin'
+        ? 'No terminal-owned capture worker is running, so a playtest started here cannot record: Screen Recording permission belongs to the terminal, not to the daemon. Run one screenshot or the playtest from an interactive terminal first.'
+        : 'Recording requires macOS 15 or later.',
     );
   const window = await resolveStudioWindow(identity);
   const started = await recordWithWorker({

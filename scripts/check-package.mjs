@@ -7,7 +7,10 @@ import { fileURLToPath } from 'node:url';
 const repositoryRoot = fileURLToPath(new URL('..', import.meta.url));
 const pluginArtifact = 'studio-plugin/RobloxCliStudio.rbxmx';
 
-const output = execFileSync('npm', ['pack', '--dry-run', '--json'], {
+// `npm run` provides npm's own entry point; invoking it through Node avoids
+// Windows' npm.cmd shim, which child_process cannot run without a shell.
+const npm = process.env.npm_execpath;
+const output = execFileSync(npm ? process.execPath : 'npm', [...(npm ? [npm] : []), 'pack', '--dry-run', '--json'], {
   cwd: repositoryRoot,
   encoding: 'utf8',
   stdio: ['ignore', 'pipe', 'inherit'],
@@ -22,10 +25,10 @@ const required = [
   'dist/daemon.js',
   'dist/capture-worker-main.js',
   'dist/install-plugin-helpers.js',
-  'dist/native/record-studio',
-  'dist/native/focus-session',
-  'dist/native/viewport-image',
-  'dist/native/studio-windows',
+  // The Swift helpers are built only on macOS.
+  ...(process.platform === 'darwin'
+    ? ['dist/native/record-studio', 'dist/native/focus-session', 'dist/native/viewport-image', 'dist/native/studio-windows']
+    : []),
   pluginArtifact,
 ];
 const missing = required.filter((path) => !files.has(path));

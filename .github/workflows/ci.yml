@@ -43,3 +43,71 @@ jobs:
       - run: npm run build
       - run: npm run check:package
       - run: npm --prefix studio-plugin audit
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            studio-plugin/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm --prefix studio-plugin ci --ignore-scripts
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: npm run check:package
+      - name: Smoke the CLI, daemon, and Studio discovery from PowerShell
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Roblox {
+            $text = node dist/cli-main.js @args
+            $code = $LASTEXITCODE
+            Write-Host "roblox $args -> exit $code $text"
+            [pscustomobject]@{ Code = $code; Body = $text | ConvertFrom-Json }
+          }
+          function Assert($condition, $message) { if (-not $condition) { throw "Assertion failed: $message" } }
+
+          Assert ((Roblox setup).Code -eq 0) 'setup succeeds'
+          Assert (Test-Path "$env:LOCALAPPDATA\Roblox\Plugins\RobloxCliStudio.rbxmx") 'plugin is installed in %LOCALAPPDATA%\Roblox\Plugins'
+
+          $refused = Roblox eval 'return 1'
+          Assert ($refused.Code -eq 3 -and $refused.Body.error.execution -eq 'not_started' -and $refused.Body.error.next -eq 'roblox daemon start') 'a stopped daemon is reported as not started'
+
+          $started = Roblox daemon start
+          Assert ($started.Code -eq 0 -and $started.Body.started -and (Get-Process -Id $started.Body.pid -ErrorAction SilentlyContinue)) 'daemon starts detached'
+          Assert ((Roblox daemon start).Body.started -eq $false) 'a second start reports the running daemon'
+          Assert ((Roblox doctor).Body.healthy) 'doctor is healthy'
+          Assert ((Roblox eval 'return 1').Body.error.code -eq 'session_required') 'eval reaches the daemon and asks for a Studio session'
+
+          $stopped = Roblox daemon stop
+          Assert ($stopped.Body.stopped -and -not (Get-Process -Id $started.Body.pid -ErrorAction SilentlyContinue)) 'daemon stops'
+          Assert (-not (Test-Path "$env:LOCALAPPDATA\roblox-cli\daemon.pid")) 'graceful shutdown removed the pid file'
+
+          $probe = "const m = await import('./dist/studio-instance-manager.js'); console.log(JSON.stringify({ observed: await m.observeStudioProcesses(), boot: await m.currentBootId() }))"
+          $empty = node --input-type=module -e $probe | ConvertFrom-Json
+          Assert ($empty.observed.status -eq 'ok' -and $empty.observed.processes.Count -eq 0) 'no Studio process is an empty snapshot'
+          # ConvertFrom-Json turns ISO-8601 strings into [datetime]; the fallback id is 'win32:<pid>:unknown-boot'.
+          Write-Host "boot id: $($empty.boot) [$($empty.boot.GetType().Name)]"
+          Assert ($empty.boot -is [datetime]) 'boot identity comes from LastBootUpTime'
+
+          # A stand-in RobloxStudioBeta.exe exercises exe discovery and the Get-Process query.
+          $versions = New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\Roblox\Versions\version-ci"
+          $fake = Join-Path $versions 'RobloxStudioBeta.exe'
+          Copy-Item (Get-Command node).Source $fake
+          $studio = Start-Process $fake -ArgumentList '-e', 'setInterval(Date.now,1000)' -PassThru -WindowStyle Hidden
+          try {
+            $exe = node --input-type=module -e "const m = await import('./dist/studio-instance-manager.js'); console.log(m.resolveStudioExe())"
+            Assert ($exe -eq $fake) 'Studio resolves from %LOCALAPPDATA%\Roblox\Versions'
+            $found = node --input-type=module -e $probe | ConvertFrom-Json
+            $entry = $found.observed.processes | Where-Object Id -eq $studio.Id
+            Assert ($entry -and $entry.Path -eq $fake -and $entry.StartTimeUtcFileTime -match '^[1-9]\d*$') 'Studio process is listed with its creation-time identity'
+            Assert ($entry.CommandLine -like '*setInterval(Date.now,1000)*') 'the command line is listed, so a self-update relaunch can be followed'
+          } finally {
+            Stop-Process -Id $studio.Id -Force
+          }

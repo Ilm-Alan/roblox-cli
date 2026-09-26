@@ -14,6 +14,7 @@ import { basename, join } from 'node:path';
 import { homedir } from 'node:os';
 import { isUtf8 } from 'node:buffer';
 import { SaxesParser } from 'saxes';
+import { windowsLocalAppData } from './paths.js';
 
 // The daemon and its one generated Studio plugin are the only runtime
 // integration. Installation is deliberately local and never fetches code.
@@ -60,10 +61,13 @@ export function configurePluginAssetForPort(
   return Buffer.from(configured, 'utf8');
 }
 
-/** Resolve the normal macOS Roblox Studio plugin directory. */
+/** Resolve the normal Roblox Studio plugin directory for this platform. */
 export function getPluginsFolder(): string {
   const override = process.env.ROBLOX_CLI_PLUGINS_DIR?.trim();
-  return override || join(homedir(), 'Documents', 'Roblox', 'Plugins');
+  if (override) return override;
+  return process.platform === 'win32'
+    ? join(windowsLocalAppData(), 'Roblox', 'Plugins')
+    : join(homedir(), 'Documents', 'Roblox', 'Plugins');
 }
 
 export interface InstallPluginAssetOptions {

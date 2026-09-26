@@ -6,7 +6,7 @@ import { BridgeService } from './bridge-service.js';
 import { createHttpServer, listenWithRetry } from './http-server.js';
 import { RobloxStudioTools } from './tools/index.js';
 import { CLI_COMMANDS } from './commands.js';
-import { assertMacOS } from './daemon-control.js';
+import { assertSupportedPlatform } from './daemon-control.js';
 import { AGENT_PROTOCOL_VERSION } from './agent-protocol.js';
 import { pluginBuildId } from './install-plugin-helpers.js';
 
@@ -15,7 +15,7 @@ const { version } = JSON.parse(readFileSync(new URL('../package.json', import.me
 // plugin (a source checkout before `npm run build`) the build check is off.
 const pluginArtifact = new URL(`../studio-plugin/${pluginAssetName()}`, import.meta.url);
 const buildId = existsSync(pluginArtifact) ? pluginBuildId(readFileSync(pluginArtifact), pluginAssetName()) : undefined;
-assertMacOS();
+assertSupportedPlatform();
 const port = Number(process.env.ROBLOX_CLI_PORT ?? 58741);
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid ROBLOX_CLI_PORT');
 const auth = resolveAuthToken();

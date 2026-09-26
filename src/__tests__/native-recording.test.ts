@@ -85,7 +85,8 @@ async function controlServer(path: string, replies: string[], onStop?: () => voi
   return { server, lines };
 }
 
-describe('stop request', () => {
+// The recorder's control channel is a Unix socket path; recording is macOS-only.
+(process.platform === 'win32' ? describe.skip : describe)('stop request', () => {
   let directory: string;
   let server: Server | undefined;
 

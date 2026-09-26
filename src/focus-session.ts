@@ -27,6 +27,10 @@ export const FOREGROUND_REFUSED = 'macOS refused to bring Studio forward while a
 export async function acquireFocus(foreground: boolean): Promise<FocusLease> {
   if (!foreground)
     return { receipt: { foreground: false }, release: async () => ({ foreground: false }) };
+  // Windows builds never activate Studio: input is engine-side virtual input
+  // there too, so only the macOS full-render-rate opt-in is unavailable.
+  if (process.platform === 'win32')
+    throw new CliCommandError('foreground_unavailable', 'Windows builds do not activate Studio; bring the Studio window to the front yourself and rerun without --foreground.');
   const helper = join(packageRoot(), 'dist/native/focus-session');
   if (process.platform !== 'darwin' || !existsSync(helper))
     throw new CliCommandError('foreground_unavailable', '--foreground needs the native focus helper; run npm run build in roblox-cli, or rerun without --foreground.');

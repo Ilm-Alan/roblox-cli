@@ -24,7 +24,8 @@ test('creates one private token file that every later resolve shares', () => {
   const first = resolveAuthToken();
   expect(first).toEqual({ token: expect.stringMatching(/^[0-9a-f]{64}$/), source: 'file', filePath: join(home, 'auth-token') });
   expect(readFileSync(join(home, 'auth-token'), 'utf8').trim()).toBe(first.token);
-  expect(statSync(join(home, 'auth-token')).mode & 0o777).toBe(0o600);
+  // Windows has no POSIX mode bits; the per-user %LOCALAPPDATA% ACL protects the file there.
+  if (process.platform !== 'win32') expect(statSync(join(home, 'auth-token')).mode & 0o777).toBe(0o600);
   expect(resolveAuthToken().token).toBe(first.token);
   expect(readdirSync(home)).toEqual(['auth-token']);
 });
@@ -33,7 +34,7 @@ test('keeps a pre-existing valid token', () => {
   writeFileSync(join(home, 'auth-token'), '  existing-token\n', { mode: 0o644 });
   expect(resolveAuthToken().token).toBe('existing-token');
   expect(readFileSync(join(home, 'auth-token'), 'utf8')).toBe('  existing-token\n');
-  expect(statSync(join(home, 'auth-token')).mode & 0o777).toBe(0o600);
+  if (process.platform !== 'win32') expect(statSync(join(home, 'auth-token')).mode & 0o777).toBe(0o600);
 });
 
 test.each(['', ' \n\t'])('replaces an empty token file %j with a shared token', (contents) => {

@@ -18,9 +18,9 @@ const START_TIMEOUT_MS = 15_000;
 const STOP_TIMEOUT_MS = 10_000;
 const PROBE_TIMEOUT_MS = 3_000;
 
-export function assertMacOS(): void {
-  if (process.platform !== 'darwin') {
-    throw new Error('roblox-cli currently supports macOS only.');
+export function assertSupportedPlatform(): void {
+  if (process.platform !== 'darwin' && process.platform !== 'win32') {
+    throw new Error('roblox-cli supports macOS and Windows only.');
   }
 }
 
@@ -114,7 +114,7 @@ function runningReport(port: number, daemon: Extract<DaemonProbe, { state: 'runn
  * terminal's pipes open. Nothing else starts it: not login, not other commands.
  */
 export async function startDaemon(port = DEFAULT_PORT): Promise<JsonObject> {
-  assertMacOS();
+  assertSupportedPlatform();
   const { daemon } = verifyBuildArtifacts();
   const current = await probeDaemon(port);
   if (current.state === 'running') return { started: false, ...runningReport(port, current) };
@@ -126,6 +126,7 @@ export async function startDaemon(port = DEFAULT_PORT): Promise<JsonObject> {
   try {
     child = spawn(process.execPath, [daemon], {
       detached: true,
+      windowsHide: true,
       stdio: ['ignore', stdout, stderr],
       env: { ...process.env, ROBLOX_CLI_PORT: String(port) },
     });
@@ -180,7 +181,7 @@ export function verifyBuildArtifacts(): { daemon: string; plugin: string } {
 }
 
 export function installBuiltPlugin(port = DEFAULT_PORT): JsonObject {
-  assertMacOS();
+  assertSupportedPlatform();
   const { plugin } = verifyBuildArtifacts();
   const packageJson = JSON.parse(readFileSync(packageJsonPath(), 'utf8')) as { version: string };
   const pluginsFolder = getPluginsFolder();
