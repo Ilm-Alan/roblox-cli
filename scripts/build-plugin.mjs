@@ -17,7 +17,9 @@ const pluginDir = join(rootDir, 'studio-plugin');
 const outDir = join(pluginDir, 'out');
 const serverDir = join(outDir, 'server');
 const modulesDir = join(outDir, 'modules');
-const includeDir = join(pluginDir, 'include');
+// rbxtsc treats this scoped package as a library and never copies its runtime,
+// so pack RuntimeLib and Promise straight from the pinned compiler package.
+const includeDir = join(pluginDir, 'node_modules', 'roblox-ts', 'include');
 const nodeModulesRbxtsDir = join(pluginDir, 'node_modules', '@rbxts');
 
 // One owned plugin artifact. Diagnostics are a CLI workflow now, so a second
@@ -102,6 +104,10 @@ const serverInitSource = readFileSync(serverInitPath, 'utf8');
 const bootstrapCount = serverInitSource.match(RUNTIME_BOOTSTRAP)?.length ?? 0;
 if (bootstrapCount !== 1) {
   console.error(`Expected exactly one RuntimeLib bootstrap (local TS = _G[script]) in ${serverInitPath}; found ${bootstrapCount}.`);
+  process.exit(1);
+}
+if (!existsSync(join(includeDir, 'RuntimeLib.lua'))) {
+  console.error(`Missing ${join(includeDir, 'RuntimeLib.lua')}; run npm --prefix studio-plugin ci.`);
   process.exit(1);
 }
 const mainSource = injectVersion(serverInitSource).replace(

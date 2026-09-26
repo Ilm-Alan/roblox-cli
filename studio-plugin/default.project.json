@@ -7,7 +7,7 @@
       "$path": "out/modules"
     },
     "include": {
-      "$path": "include"
+      "$path": "node_modules/roblox-ts/include"
     },
     "node_modules": {
       "$className": "Folder",
