@@ -97,11 +97,21 @@ export async function captureNativeStudioWindow(
   try {
     const window = await resolveStudioWindow(identity);
     const windowId = window.id;
-    await execFileAsync('screencapture', ['-x', '-o', '-l', String(windowId), pngPath], {
-      encoding: 'utf8',
-      timeout: 15_000,
-      maxBuffer: 64 * 1024,
-    });
+    try {
+      await execFileAsync('screencapture', ['-x', '-o', '-l', String(windowId), pngPath], {
+        encoding: 'utf8',
+        timeout: 15_000,
+        maxBuffer: 64 * 1024,
+      });
+    }
+    catch (error) {
+      // screencapture says only "could not create image from window" when the
+      // calling process lacks Screen Recording permission or the window id
+      // vanished between listing and capture; name both causes.
+      const stderr = error && typeof error === 'object' && 'stderr' in error ? String(error.stderr).trim() : '';
+      const detail = stderr || (error instanceof Error ? error.message : String(error));
+      throw new Error(`macOS screencapture could not read Studio window ${windowId}: ${detail}. The capturing process needs Screen Recording permission (System Settings > Privacy & Security > Screen Recording, for the terminal that started the capture worker), and the window must still be open.`);
+    }
     const png = readFileSync(pngPath);
     const dimensions = imageDimensions(png);
 

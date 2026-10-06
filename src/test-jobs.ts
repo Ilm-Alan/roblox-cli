@@ -21,9 +21,21 @@ export function childRequestId(parent: string, index: number): string {
     : `${parent.slice(0, 24)}-${createHash('sha256').update(parent).digest('hex').slice(0, 40)}`;
   return prefix + suffix;
 }
+/**
+ * How long an attended job survives without a status read from whoever is
+ * following it. The CLI polls every 250 ms; a follower that stops polling
+ * (killed, suspended, disconnected) loses its job instead of leaving the
+ * session owned by work nobody is watching.
+ */
+export const FOLLOW_LEASE_MS = 30_000;
+/** How long `cancel` waits for the run's teardown before answering with the current state. */
+export const CANCEL_SETTLE_MS = 30_000;
+
 export interface JobProgress {
   startIndex: number;
   cancelled(): boolean;
+  /** Aborted when cancellation is requested; waits and polls race it, native actions do not. */
+  cancelSignal: AbortSignal;
   phase(name: string): void;
   ready(identity: string[]): void;
   stepStarted(index: number, step: Json): void;
@@ -55,6 +67,10 @@ export interface TestJob extends Json {
   }[];
   result_file?: string;
   cancel_requested?: boolean;
+  /** Attended jobs are cancelled when their follower's lease lapses; detached jobs run unattended. */
+  attended?: boolean;
+  /** 1 for the first run; each resume starts the next attempt. */
+  attempt?: number;
 }
 interface Dependencies {
   session(): {
@@ -65,6 +81,23 @@ interface Dependencies {
   execute(body: Json, context: ToolInvocationContext): Promise<unknown>;
   check(condition: Condition): Promise<boolean>;
   cleanup?(body: Json): Promise<unknown>;
+  /**
+   * Teardown for a run that threw after reaching its runtime: release held
+   * input, stop the job's runtime peers and confirm they are gone.
+   */
+  recover?(body: Json, runtime: string[]): Promise<unknown>;
+}
+interface Timing {
+  leaseMs: number;
+  cancelSettleMs: number;
+}
+/** Resolve when `work` settles or `ms` passes, whichever is first. */
+async function settledWithin(work: Promise<unknown>, ms: number): Promise<void> {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  const timer = setTimeout(resolve, ms);
+  timer.unref();
+  await Promise.race([work.catch(() => undefined), promise]);
+  clearTimeout(timer);
 }
 export function atomicJson(file: string, value: unknown): void {
   const temporary = `${file}.${randomUUID()}.tmp`;
@@ -81,8 +114,14 @@ export function atomicJson(file: string, value: unknown): void {
 export class TestJobs {
   private readonly running = new Map<string, Promise<void>>();
   private readonly records = new Map<string, TestJob>();
+  private readonly cancellers = new Map<string, AbortController>();
+  private readonly leases = new Map<string, NodeJS.Timeout>();
   readonly directory: string;
-  constructor(private readonly deps: Dependencies, directory = join(dataDirectory(), 'test-jobs')) {
+  constructor(
+    private readonly deps: Dependencies,
+    directory = join(dataDirectory(), 'test-jobs'),
+    private readonly timing: Timing = { leaseMs: FOLLOW_LEASE_MS, cancelSettleMs: CANCEL_SETTLE_MS },
+  ) {
     this.directory = directory;
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     for (const id of readdirSync(directory)) {
@@ -201,7 +240,7 @@ export class TestJobs {
       job_id: id, state: 'queued', execution: 'pending', phase: 'admitted', ...session,
       created_at: new Date().toISOString(), updated_at: '', next_step: 0, total_steps: scenario.steps.length,
       scenario_hash: scenario.fingerprint, completed_steps: [], warnings: scenario.warnings,
-      directory: dir, foreground: body.foreground ?? 'auto',
+      directory: dir, foreground: body.foreground === true, attended: body.detach !== true,
     };
     this.save(job);
     this.schedule(job, normalized);
@@ -212,6 +251,31 @@ export class TestJobs {
     const run = new Promise<void>(resolve => setImmediate(resolve)).then(() => this.run(job, body));
     this.running.set(job.job_id, run);
     void run.finally(() => this.running.delete(job.job_id)).catch(() => { });
+    this.renewLease(job.job_id);
+  }
+  /**
+   * A status read renews an attended job's lease. Whoever reads its status is
+   * following it; when nobody has for `leaseMs`, the job is cancelled with its
+   * normal teardown rather than left owning the session.
+   */
+  observe(id: string): void {
+    if (this.leases.has(id)) this.renewLease(id);
+  }
+  private renewLease(id: string) {
+    clearTimeout(this.leases.get(id));
+    this.leases.delete(id);
+    const job = this.records.get(id);
+    if (job?.attended !== true || job.cancel_requested === true || !['queued', 'running'].includes(job.state)) return;
+    const timer = setTimeout(() => {
+      this.leases.delete(id);
+      void this.cancel(id, 'follower_lost').catch(() => { });
+    }, this.timing.leaseMs);
+    timer.unref();
+    this.leases.set(id, timer);
+  }
+  private endLease(id: string) {
+    clearTimeout(this.leases.get(id));
+    this.leases.delete(id);
   }
   private artifact(id: string, label: string, value: unknown): unknown {
     const dir = this.folder(id);
@@ -241,24 +305,29 @@ export class TestJobs {
     return result;
   }
   private async run(job: TestJob, body: Json) {
+    const canceller = new AbortController();
+    this.cancellers.set(job.job_id, canceller);
     try {
       if (job.cancel_requested) {
         this.artifact(job.job_id, 'result', { passed: false, cancelled: true, execution: 'not_started', steps: [] });
         job.result_file = join(this.folder(job.job_id), 'result.json');
         job.state = 'cancelled';
         job.execution = 'not_started';
-        this.save(job);
         return;
       }
       job.state = 'running';
       this.save(job);
+      // Each resume is a new attempt with its own operation ids: re-running a
+      // step index must not collide with the first attempt's retained ids.
+      const requestId = (job.attempt ?? 1) > 1 ? `${job.job_id}:attempt-${job.attempt}` : job.job_id;
       const progress: JobProgress = {
         startIndex: job.next_step,
         cancelled: () => job.cancel_requested === true,
+        cancelSignal: canceller.signal,
         phase: phase => { job.phase = phase; this.save(job); },
         ready: identity => { job.runtime_identity = identity; this.save(job); },
         stepStarted: (index, step) => {
-          job.in_flight = { index, name: String(step.name), request_id: childRequestId(job.job_id, index) };
+          job.in_flight = { index, name: String(step.name), request_id: childRequestId(requestId, index) };
           job.phase = 'step';
           this.save(job);
         },
@@ -273,39 +342,62 @@ export class TestJobs {
           this.save(job);
         },
       };
-      const value = await this.deps.execute(body, { signal: new AbortController().signal, requestId: job.job_id, job: progress });
+      const value = await this.deps.execute(body, { signal: new AbortController().signal, requestId, job: progress });
       const finalValue = value && typeof value === 'object' ? { ...value as Json } : { result: value };
       if ('steps' in finalValue)
         finalValue.steps = [...job.completed_steps].sort((a, b) => a.index - b.index).map(step => JSON.parse(readFileSync(step.file, 'utf8')));
       const result = this.artifact(job.job_id, 'result', finalValue) as Json;
       job.result_file = join(this.folder(job.job_id), 'result.json');
-      const uncertain = result.execution === 'unknown';
-      job.state = uncertain ? 'unknown' : job.cancel_requested ? 'cancelled' : result.passed === false || result.error ? 'failed' : 'completed';
-      job.execution = uncertain ? 'unknown' : job.state === 'completed' ? 'success' : job.state === 'cancelled' ? 'stopped' : 'failed';
-      job.phase = 'settled';
+      // A run that returned has already been through its own teardown, so it
+      // settles: an uncertain step is reported as `execution: unknown` on a
+      // failed job, never as a job that keeps owning the session.
+      job.state = job.cancel_requested ? 'cancelled' : result.passed === false || result.error ? 'failed' : 'completed';
+      job.execution = job.state === 'completed' ? 'success' : job.state === 'cancelled' ? 'stopped' : result.execution === 'unknown' ? 'unknown' : 'failed';
     }
     catch (error) {
-      const result = publicToolErrorBody('test', error);
-      this.artifact(job.job_id, 'result', result);
+      // A run that threw skipped its own teardown. If it had reached its
+      // runtime, stop and verify that runtime before settling; either way the
+      // job settles, so a startup failure never leaves the session owned.
+      const failure = publicToolErrorBody('test', error);
+      const execution = String((failure.error as Json)?.execution ?? 'unknown');
+      let recovery: unknown;
+      if (job.runtime_identity?.length && this.deps.recover) {
+        try { recovery = await this.deps.recover(body, job.runtime_identity); }
+        catch (recoverError) { recovery = { released: false, runtime: 'unverified', error: String(recoverError) }; }
+      }
+      this.artifact(job.job_id, 'result', { ...failure, passed: false, execution, ...(recovery === undefined ? {} : { recovery }) });
       job.result_file = join(this.folder(job.job_id), 'result.json');
-      const execution = (result.error as Json)?.execution;
-      job.state = execution === 'not_started' && !job.in_flight ? 'failed' : 'unknown';
-      job.execution = job.state === 'unknown' ? 'unknown' : 'not_started';
-      job.phase = 'interrupted';
+      job.state = job.cancel_requested ? 'cancelled' : 'failed';
+      job.execution = execution;
     }
     finally {
+      job.phase = 'settled';
+      this.cancellers.delete(job.job_id);
+      this.endLease(job.job_id);
       this.save(job);
     }
   }
-  async cancel(id: string): Promise<TestJob> {
+  /**
+   * Request cancellation and wait, bounded, for the run to settle.
+   *
+   * Waits (`wait`, `wait_until`, `--duration`) end at once; an in-flight native
+   * action is allowed to answer, because aborting it would leave its outcome
+   * unknown. The run then takes its normal teardown: the recorder is
+   * finalized, held input released and the playtest stopped and verified.
+   * The returned status is settled unless teardown outlasts `cancelSettleMs`.
+   */
+  async cancel(id: string, reason: 'requested' | 'follower_lost' = 'requested'): Promise<TestJob> {
     const job = this.require(id);
     if (['completed', 'failed', 'cancelled'].includes(job.state))
       return this.status(id)!;
+    this.endLease(id);
+    if (job.cancel_requested !== true)
+      job.cancellation = { reason, requested_at: new Date().toISOString(), policy: 'interrupt_waits_then_teardown', rollback: false, unresolved: job.in_flight ?? null };
     job.cancel_requested = true;
     if (job.state === 'running' || job.state === 'queued')
       job.state = 'cancelling';
-    job.cancellation = { policy: 'finish_in_flight_then_release_input', rollback: false, unresolved: job.in_flight ?? null };
     this.save(job);
+    this.cancellers.get(id)?.abort();
     if (job.state === 'unknown') {
       if (this.originalRuntimeGone(job)) {
         this.settleRuntimeGone(job);
@@ -327,7 +419,10 @@ export class TestJobs {
         this.settleCancelled(job, 'cleanup_session_absent');
       else
         this.save(job);
+      return this.status(id)!;
     }
+    const run = this.running.get(id);
+    if (run) await settledWithin(run, this.timing.cancelSettleMs);
     return this.status(id)!;
   }
   private requireOriginalRuntime(job: TestJob) {
@@ -335,9 +430,11 @@ export class TestJobs {
     if (session.session_id !== job.session_id || session.instance_id !== job.instance_id || !job.runtime_identity?.length || JSON.stringify(this.deps.runtime()) !== JSON.stringify(job.runtime_identity))
       throw new CliCommandError('resume_session_mismatch', 'The original live play session cannot be verified. No input was sent.');
   }
-  async resume(id: string, foreground?: string): Promise<TestJob> {
-    if (foreground !== undefined && !['auto', 'never', 'required'].includes(foreground))
-      throw new CliCommandError('invalid_argument', 'foreground must be auto, never or required.');
+  async resume(id: string, options: { foreground?: unknown; detach?: unknown } = {}): Promise<TestJob> {
+    if (options.foreground !== undefined && typeof options.foreground !== 'boolean')
+      throw new CliCommandError('invalid_argument', 'foreground must be a boolean.');
+    if (options.detach !== undefined && typeof options.detach !== 'boolean')
+      throw new CliCommandError('invalid_argument', 'detach must be a boolean.');
     const job = this.require(id);
     if (job.phase === 'resume_validating')
       throw new CliCommandError('job_conflict', 'Resume validation is already running.');
@@ -402,7 +499,9 @@ export class TestJobs {
       throw error;
     }
     job.phase = 'resuming';
-    job.foreground = foreground ?? job.foreground ?? body.foreground ?? 'auto';
+    job.foreground = options.foreground ?? job.foreground === true;
+    job.attended = options.detach !== true;
+    job.attempt = (job.attempt ?? 1) + 1;
     delete job.result_file;
     this.save(job);
     this.schedule(job, { ...body, foreground: job.foreground, keep_open: true });

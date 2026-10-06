@@ -67,24 +67,21 @@ export async function ensureCaptureWorker(): Promise<void> {
   }
   throw new Error('The native capture worker did not start');
 }
+/**
+ * Native window capture always goes through the terminal-owned worker. The
+ * daemon never runs `screencapture` itself: Screen Recording permission
+ * belongs to the responsible application, the detached daemon usually has
+ * none, and macOS then refuses with "could not create image from window" (the
+ * same refusal ScreenCaptureKit reports as -3801). A daemon-side retry could
+ * only repeat that refusal and bury the worker's real error under it.
+ */
 export async function captureWithWorker(format?: 'png' | 'jpeg', quality?: number, identity?: {
   placeName?: string;
   pid?: number;
 }): Promise<NativeScreenCapture> {
-  if (existsSync(socket())) {
-    try {
-      return await call({ format, quality, identity }) as NativeScreenCapture;
-    }
-    catch (workerError) {
-      try {
-        return await captureNativeStudioWindow(format, quality, identity);
-      }
-      catch (directError) {
-        throw new Error(`Capture worker: ${String(workerError)}; daemon capture: ${String(directError)}`);
-      }
-    }
-  }
-  return captureNativeStudioWindow(format, quality, identity);
+  if (!existsSync(socket()))
+    throw new Error('The terminal-owned capture worker is not running, so a native capture here would have no Screen Recording permission. Run the command from an interactive terminal, which starts the worker.');
+  return await call({ format, quality, identity }) as NativeScreenCapture;
 }
 /**
  * Ask the terminal-owned worker to start the native recorder.

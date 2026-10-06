@@ -158,6 +158,7 @@ function publicRuntimeHealth(value: unknown, role: string): Record<string, unkno
       ['secondsSinceFrame', 'seconds_since_frame'],
       ['lastFrameAt', 'last_frame_at'],
       ['frameCount', 'frame_count'],
+      ['sampledAt', 'sampled_at'],
       ['frameTimeMs', 'frame_time_ms'],
     ]),
     capture: copyKnownFields(body.capture, [

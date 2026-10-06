@@ -7,15 +7,30 @@ export interface FocusLease {
   receipt: Record<string, unknown>;
   release(): Promise<Record<string, unknown>>;
 }
-export async function acquireFocus(policy: string, input: boolean): Promise<FocusLease> {
-  if (!['auto', 'never', 'required'].includes(policy))
-    throw new CliCommandError('invalid_foreground_policy', 'foreground must be auto, never or required');
-  if (!input && policy !== 'required')
-    return { receipt: { activated: false, inspection: true }, release: async () => ({ restored: false }) };
+
+/** The message a refused activation fails with, before any playtest starts. */
+export const FOREGROUND_REFUSED = 'macOS refused to bring Studio forward while another app is in use; click Studio or rerun without --foreground.';
+
+/**
+ * Studio runs in the background unless the caller explicitly opts in with
+ * `--foreground`. Every input path is engine-side virtual input, and capture
+ * and recording work with Studio behind another app; the only thing the
+ * foreground buys is Studio's full render rate (it throttles itself to about
+ * 15 fps when it is not the frontmost app), so it is an opt-in for full-rate
+ * video, never a requirement.
+ *
+ * Without the opt-in this spawns nothing: no focus helper, no caffeinate, no
+ * display wake. With it, the helper activates Studio once, fails fast when
+ * macOS refuses, keeps the display awake for the lease only, and restores the
+ * previous app on release unless the owner switched apps meanwhile.
+ */
+export async function acquireFocus(foreground: boolean): Promise<FocusLease> {
+  if (!foreground)
+    return { receipt: { foreground: false }, release: async () => ({ foreground: false }) };
   const helper = join(packageRoot(), 'dist/native/focus-session');
   if (process.platform !== 'darwin' || !existsSync(helper))
-    throw new CliCommandError('foreground_unavailable', 'Build the native focus helper before running interactive scenarios.');
-  const child = spawn(helper, [policy], { stdio: ['pipe', 'pipe', 'pipe'] });
+    throw new CliCommandError('foreground_unavailable', '--foreground needs the native focus helper; run npm run build in roblox-cli, or rerun without --foreground.');
+  const child = spawn(helper, [], { stdio: ['pipe', 'pipe', 'pipe'] });
   let buffer = '';
   let settled = false;
   let releasedLine: Record<string, unknown> | undefined;
@@ -42,7 +57,7 @@ export async function acquireFocus(policy: string, input: boolean): Promise<Focu
         const value = JSON.parse(line) as Record<string, unknown>;
         if (value.error) {
           clearTimeout(timeout);
-          reject(new CliCommandError(String(value.code ?? 'foreground_unavailable'), String(value.error)));
+          reject(new CliCommandError('foreground_unavailable', value.refused === true ? FOREGROUND_REFUSED : String(value.error)));
         }
         else if (value.acquired) {
           settled = true;
@@ -55,8 +70,8 @@ export async function acquireFocus(policy: string, input: boolean): Promise<Focu
       catch { /* Keep stderr and protocol separate. */ }
     }
   });
-  const receipt = await acquired;
-  // Keep the display awake only for this lease, never for the daemon lifetime.
+  const receipt = { foreground: true, ...await acquired };
+  // Keep the display awake only for this opted-in lease, never otherwise.
   const awake = child.pid ? spawn('/usr/bin/caffeinate', ['-d', '-i', '-u', '-w', String(child.pid)], { stdio: 'ignore' }) : undefined;
   awake?.on('error', () => { });
   child.once('exit', () => awake?.kill());

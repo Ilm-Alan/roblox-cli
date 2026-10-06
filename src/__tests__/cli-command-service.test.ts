@@ -8,11 +8,12 @@ jest.mock('../native-screen-capture.js', () => ({
 import http from 'node:http';
 import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import * as viewport from '../viewport-capture.js';
 import * as recording from '../native-recording.js';
 import * as worker from '../capture-worker.js';
+import { acquireFocus } from '../focus-session.js';
 import { tmpdir } from 'node:os';
 import { BridgeService, RequestFailure } from '../bridge-service.js';
 import { CliCommandService } from '../cli-command-service.js';
@@ -465,6 +466,45 @@ describe('roblox-cli command contract', () => {
     expect(input).not.toHaveBeenCalled();
   });
 
+  test('an input scenario never asks for the foreground unless the caller opts in', async () => {
+    const acquire = acquireFocus as jest.Mock;
+    const bridge = new BridgeService();
+    registerEdit(bridge);
+    registerPeer(bridge, 'client-1');
+    const tools = new RobloxStudioTools(bridge);
+    jest.spyOn(tools, 'soloPlaytest').mockResolvedValue({ success: true } as never);
+    jest.spyOn(tools, 'getRuntimeHealth').mockResolvedValue({ peers: {} } as never);
+    jest.spyOn(tools, 'simulateKeyboardInput').mockResolvedValue({ success: true } as never);
+    const service = new CliCommandService(tools, bridge);
+    jest.spyOn(service, 'logs').mockResolvedValue({ entries: [] });
+    jest.spyOn(service, 'screenshot').mockResolvedValue({ width: 2, height: 2 });
+    await service.open({ source: 'attach' });
+    acquire.mockClear();
+    await service.test({ action: 'play', scenario: { steps: [{ type: 'keyboard', key_code: 'E' }] } });
+    expect(acquire.mock.calls).toEqual([[false]]);
+    await service.test({ action: 'play', foreground: true, scenario: { steps: [{ type: 'keyboard', key_code: 'E' }] } });
+    expect(acquire.mock.calls).toEqual([[false], [true]]);
+    expect(() => service.submitTest({ action: 'play', foreground: 'auto', keep_open: true })).toThrow(expect.objectContaining({ code: 'invalid_argument', message: 'foreground must be a boolean.' }));
+  });
+
+  test('the receipt reports the rate Studio rendered at and warns below full rate', async () => {
+    const bridge = new BridgeService();
+    registerEdit(bridge);
+    registerPeer(bridge, 'client-1');
+    const tools = new RobloxStudioTools(bridge);
+    jest.spyOn(tools, 'soloPlaytest').mockResolvedValue({ success: true } as never);
+    const client = (frames: number, at: number) => ({ peers: { 'client-1': { role: 'client-1', render: { available: true, rendering: true, frame_count: frames, sampled_at: at } } } });
+    jest.spyOn(tools, 'getRuntimeHealth')
+      .mockResolvedValueOnce(client(100, 10) as never)
+      .mockResolvedValueOnce(client(250, 20) as never);
+    const service = new CliCommandService(tools, bridge);
+    jest.spyOn(service, 'logs').mockResolvedValue({ entries: [] });
+    await service.open({ source: 'attach' });
+    const result = await service.test({ action: 'play', duration_ms: 0 }) as Record<string, unknown>;
+    expect(result.render_fps).toBe(15);
+    expect(result.warnings).toEqual(['Studio renders at ~15 fps while it is not the frontmost window; pass --foreground for a full-rate video.']);
+  });
+
   test('readiness must become true before a playtest can pass', async () => {
     const bridge = new BridgeService();
     registerEdit(bridge);
@@ -834,6 +874,7 @@ describe('scenario recording under a playtest job', () => {
     jest.spyOn(tools, 'getRuntimeHealth').mockResolvedValue({ peers: {} } as never);
     const service = new CliCommandService(tools, bridge);
     jest.spyOn(service, 'logs').mockResolvedValue({ entries: [] });
+    jest.spyOn(service, 'screenshot').mockResolvedValue({ width: 2, height: 2 });
     jest.spyOn(service, 'evaluate').mockImplementation((async (body: { code: string }) => (
       body.code.includes('RobloxCliCalibration')
         ? { result: { width: 100, height: 50, input_width: 100, input_height: 50 } }
@@ -859,8 +900,9 @@ describe('scenario recording under a playtest job', () => {
       width: 100, height: 50,
       viewport: { mode: 'calibrated_crop', crop_in_capture_pixels: { x: 4, y: 6, width: 100, height: 50 } },
     }));
-    const stop = jest.spyOn(recording, 'stopNativeRecording').mockResolvedValue({
-      file, duration_seconds: 12.5, width: 100, height: 50, audio_tracks: 1, stop_reason: 'scenario_completed',
+    const stop = jest.spyOn(recording, 'stopNativeRecording').mockImplementation(async (partial = '') => {
+      writeFileSync(partial, 'video');
+      return { file: partial, duration_seconds: 12.5, width: 100, height: 50, audio_tracks: 1, stop_reason: 'scenario_completed' };
     });
     const captureWorker = jest.spyOn(worker, 'ensureCaptureWorker').mockResolvedValue(undefined);
     try {
@@ -881,7 +923,9 @@ describe('scenario recording under a playtest job', () => {
       expect(worker.activeWorkerSocket).toHaveBeenCalled();
       expect(captureWorker).not.toHaveBeenCalled();
       expect(start).toHaveBeenCalledTimes(1);
-      expect(start.mock.calls[0][0]).toMatchObject({ file });
+      // The recorder writes a fresh sibling, moved onto the requested path once finalized.
+      const partial = start.mock.calls[0][0].file;
+      expect(partial).toMatch(/gameplay\.recording-[0-9a-f]{8}\.mp4$/);
       // The calibrated crop is what the worker is asked to apply.
       expect(start.mock.calls[0][0].crop).toMatchObject({ x: 4, y: 6, width: 100, height: 50, capture_width: 200 });
 
@@ -903,8 +947,10 @@ describe('scenario recording under a playtest job', () => {
         expect(typeof step.ended_at_ms).toBe('number');
       }
       // The recorder stops before the playtest is torn down.
-      expect(stop).toHaveBeenCalledWith(file);
+      expect(stop).toHaveBeenCalledWith(partial);
       expect(lifecycle.mock.calls.map(call => call[0])).toEqual(['status']);
+      expect(readFileSync(file, 'utf8')).toBe('video');
+      expect(existsSync(partial)).toBe(false);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -919,7 +965,10 @@ describe('scenario recording under a playtest job', () => {
       started_at: new Date().toISOString(), width: 1920, height: 1180,
       viewport: { mode: 'full_window', reason: 'no calibrated crop was requested' },
     });
-    jest.spyOn(recording, 'stopNativeRecording').mockResolvedValue({ file, duration_seconds: 3, width: 1920, height: 1180, audio_tracks: 1 });
+    jest.spyOn(recording, 'stopNativeRecording').mockImplementation(async (partial = '') => {
+      writeFileSync(partial, 'video');
+      return { file: partial, duration_seconds: 3, width: 1920, height: 1180, audio_tracks: 1 };
+    });
     jest.spyOn(worker, 'ensureCaptureWorker').mockResolvedValue(undefined);
     try {
       const { service } = recordedService(async () => ({ result: true }));
@@ -939,7 +988,7 @@ describe('scenario recording under a playtest job', () => {
     }
   });
 
-  test('a recording that cannot start fails the command rather than reporting success', async () => {
+  test('a recording that cannot start fails the run, skips the steps and still settles', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'roblox-cli-record-fail-'));
     const file = join(directory, 'gameplay.mp4');
     jest.spyOn(viewport, 'calibratedViewportRect').mockRejectedValue(new Error('no visible client'));
@@ -948,10 +997,67 @@ describe('scenario recording under a playtest job', () => {
     try {
       const { service } = recordedService(async () => ({ result: true }));
       await service.open({ source: 'attach' });
-      await expect(service.test({
+      const result = parseResult(await service.test({
         action: 'play', record: file,
         scenario: { steps: [{ type: 'wait', name: 'hold', duration_ms: 5 }] },
-      })).rejects.toThrow(/declined TCCs/);
+      }));
+      expect(result).toMatchObject({
+        passed: false, execution: 'failed',
+        outcome: { passed: false, steps_passed: 0, steps_total: 1 },
+        evidence: { recording: { started: false, failure: expect.stringContaining('declined TCCs') } },
+        failure: { code: 'playtest_failed' },
+      });
+      expect(result.steps).toEqual([]);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test('an existing --record file is refused at admission, before any job exists, unless overwrite is set', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'roblox-cli-record-exists-'));
+    const file = join(directory, 'gameplay.mp4');
+    writeFileSync(file, 'previous');
+    try {
+      const { service } = recordedService(async () => ({ result: true }));
+      await service.open({ source: 'attach' });
+      const scenario = { steps: [{ type: 'wait', name: 'hold', duration_ms: 5 }] };
+      expect(() => service.submitTest({ action: 'play', record: file, scenario }, 'refused')).toThrow(expect.objectContaining({ code: 'output_exists' }));
+      expect(service.jobs.status('refused')).toBeUndefined();
+      expect(() => service.submitTest({ action: 'play', record: 'relative.mp4', scenario }, 'relative')).toThrow(expect.objectContaining({ code: 'invalid_argument' }));
+      expect(() => service.submitTest({ action: 'play', overwrite: true, scenario }, 'no-record')).toThrow(expect.objectContaining({ code: 'invalid_argument' }));
+      expect(service.submitTest({ action: 'play', record: file, overwrite: true, detach: true, scenario }, 'admitted')).toMatchObject({ state: 'queued' });
+      await service.jobs.cancel('admitted');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test('--overwrite replaces the file only with a finalized video of a passing run', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'roblox-cli-record-overwrite-'));
+    const file = join(directory, 'gameplay.mp4');
+    writeFileSync(file, 'previous');
+    let take = 0;
+    jest.spyOn(recording, 'stopNativeRecording').mockImplementation(async (partial = '') => {
+      writeFileSync(partial, `take-${++take}`);
+      return { file: partial, duration_seconds: 1, width: 100, height: 50, audio_tracks: 1 };
+    });
+    try {
+      let verdict = false;
+      const { service } = recordedService(async () => ({ result: verdict }));
+      await service.open({ source: 'attach' });
+      const play = () => service.test({ action: 'play', record: file, overwrite: true, scenario: { steps: [{ type: 'eval', name: 'check', code: 'return ok' }] } });
+      const failed = parseResult(await play());
+      // A failed run keeps the previous video and says where the new one is.
+      expect(readFileSync(file, 'utf8')).toBe('previous');
+      const kept = (failed.recording as Record<string, unknown>).file as string;
+      expect(kept).toMatch(/gameplay\.recording-[0-9a-f]{8}\.mp4$/);
+      expect(readFileSync(kept, 'utf8')).toBe('take-1');
+      expect((failed.cleanup as Record<string, unknown>).warnings).toEqual([expect.stringContaining('was kept because this run did not pass')]);
+      verdict = true;
+      const passed = parseResult(await play());
+      expect(passed).toMatchObject({ passed: true, recording: { file } });
+      expect(readFileSync(file, 'utf8')).toBe('take-2');
+      expect(readdirSync(directory).filter(name => name.endsWith('.mp4')).sort()).toEqual(['gameplay.mp4', kept.slice(directory.length + 1)].sort());
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -1035,7 +1141,7 @@ describe('teardown cannot wedge a job', () => {
   // A teardown await that never settles used to leave the job in `cleanup`
   // forever, keeping the session owned and refusing every later playtest. The
   // deadline is not a nicety: it is what makes cancellation terminate.
-  test('a recorder that never finalizes still lets the playtest settle', async () => {
+  test('a recorder that never finalizes still lets the playtest settle, failing on cleanup only', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'roblox-cli-wedge-out-'));
     const file = join(directory, 'gameplay.mp4');
     jest.useFakeTimers();
@@ -1071,8 +1177,13 @@ describe('teardown cannot wedge a job', () => {
       expect(result.recording).toBeUndefined();
       const evidence = result.evidence as Record<string, unknown>;
       expect((evidence.recording as Record<string, unknown>).finalize_failure).toContain('did not finalize');
-      expect(evidence.cleanup_deadlines).toEqual([{ step: 'recording_finalize', deadline_ms: 90_000 }]);
-      expect(result.passed).toBe(true);
+      // The scenario passed; the missing video is a cleanup failure.
+      expect(result).toMatchObject({
+        passed: false,
+        outcome: { passed: true, steps_passed: 1 },
+        cleanup: { passed: false, failures: [expect.stringContaining('recording_not_finalized')], deadlines: [{ step: 'recording_finalize', deadline_ms: 90_000 }] },
+        failure: { code: 'cleanup_failed' },
+      });
     } finally {
       jest.useRealTimers();
       rmSync(directory, { recursive: true, force: true });
@@ -1106,9 +1217,147 @@ describe('teardown cannot wedge a job', () => {
       )) as Record<string, unknown>;
       const evidence = result.evidence as Record<string, unknown>;
       expect(evidence.focus_release).toBeUndefined();
-      expect(evidence.cleanup_deadlines).toEqual([{ step: 'focus_release', deadline_ms: 10_000 }]);
+      expect(result.cleanup).toMatchObject({ deadlines: [{ step: 'focus_release', deadline_ms: 10_000 }] });
     } finally {
       jest.useRealTimers();
     }
+  });
+});
+
+describe('teardown stops the playtest and proves it', () => {
+  const previousHome = process.env.ROBLOX_CLI_HOME;
+  let testHome: string;
+
+  beforeEach(() => {
+    testHome = mkdtempSync(`${tmpdir()}/roblox-cli-stop-`);
+    process.env.ROBLOX_CLI_HOME = testHome;
+    (worker.activeWorkerSocket as jest.Mock).mockReset();
+    (worker.activeWorkerSocket as jest.Mock).mockReturnValue(true);
+    (worker.recordWithWorker as jest.Mock).mockReset();
+    (viewport.calibratedViewportRect as jest.Mock).mockReset();
+  });
+
+  afterEach(() => {
+    if (previousHome === undefined) delete process.env.ROBLOX_CLI_HOME;
+    else process.env.ROBLOX_CLI_HOME = previousHome;
+    rmSync(testHome, { recursive: true, force: true });
+    jest.restoreAllMocks();
+  });
+
+  /**
+   * A playtest the job starts itself: `start` connects a server and client,
+   * and `stop` does whatever the test says, including leaving them connected.
+   */
+  function freshPlaytest(stop: (bridge: BridgeService) => unknown) {
+    const bridge = new BridgeService();
+    registerEdit(bridge);
+    const tools = new RobloxStudioTools(bridge);
+    const lifecycle = jest.spyOn(tools, 'soloPlaytest').mockImplementation((async (action: string) => {
+      if (action === 'start') {
+        registerPeer(bridge, 'server');
+        registerPeer(bridge, 'client-1');
+        return { success: true };
+      }
+      return action === 'stop' ? stop(bridge) : { success: true };
+    }) as never);
+    jest.spyOn(tools, 'getRuntimeHealth').mockResolvedValue({ peers: {} } as never);
+    const service = new CliCommandService(tools, bridge);
+    jest.spyOn(service, 'logs').mockResolvedValue({ entries: [] });
+    jest.spyOn(service, 'screenshot').mockResolvedValue({ width: 2, height: 2 });
+    // Preflight compiles every snippet; `return false` is the one condition that never holds.
+    jest.spyOn(service, 'evaluate').mockImplementation((async (body: { code: string }) => (
+      body.code.includes('loadstring') ? { result: { passed: true, failures: [] } } : { result: !body.code.includes('return false') }
+    )) as never);
+    return { bridge, service, lifecycle };
+  }
+
+  const disconnectRuntime = (bridge: BridgeService) => {
+    bridge.unregisterPeer('instance:test/server');
+    bridge.unregisterPeer('instance:test/client-1');
+  };
+
+  test('a stop request that times out after the runtime ended passes, with a cleanup warning', async () => {
+    const { service, lifecycle } = freshPlaytest((bridge) => {
+      // EndTest ran, the runtime is gone, but the edit peer's reply was lost.
+      disconnectRuntime(bridge);
+      return { success: false, error: 'Edit stop request failed.', detail: 'Request timeout: r-1; executing; unknown; waiter ended, execution is not cancelled or rolled back' };
+    });
+    await service.open({ source: 'attach' });
+    const result = parseResult(await service.test({ action: 'play', scenario: { steps: [{ type: 'eval', name: 'check', target: 'client-1', code: 'return true' }] } }));
+    expect(result).toMatchObject({
+      passed: true, execution: 'success',
+      outcome: { passed: true, steps_passed: 1, steps_total: 1 },
+      cleanup: {
+        passed: true, runtime: 'stopped', failures: [],
+        stop: { confirmed: true, attempts: [{ method: 'playtest_stop', ok: false, error: expect.stringContaining('Request timeout') }] },
+        warnings: [expect.stringContaining('confirmed gone')],
+      },
+    });
+    expect(result.failure).toBeUndefined();
+    expect(lifecycle.mock.calls.map(call => call[0])).toEqual(['start', 'status', 'stop']);
+  });
+
+  test('a runtime that will not stop is retried, escalated to the play server, and fails cleanup, not the scenario', async () => {
+    jest.useFakeTimers();
+    try {
+      const { bridge, service, lifecycle } = freshPlaytest(() => ({ success: false, error: 'Playtest teardown did not complete.' }));
+      const endTest = jest.spyOn(bridge, 'sendRequest').mockResolvedValue({ error: 'EndTest failed' });
+      await service.open({ source: 'attach' });
+      const result = parseResult(await settleWithTimers(
+        service.test({ action: 'play', scenario: { steps: [{ type: 'eval', name: 'check', target: 'client-1', code: 'return true' }] } }),
+      ));
+      expect(result).toMatchObject({
+        passed: false, execution: 'failed',
+        outcome: { passed: true },
+        cleanup: {
+          passed: false, runtime: 'still_running',
+          stop: { confirmed: false, attempts: [{ method: 'playtest_stop', ok: false }, { method: 'playtest_stop', ok: false }, { method: 'server_end_test', ok: false, error: 'EndTest failed' }] },
+          failures: [expect.stringContaining('runtime_not_confirmed_stopped')],
+        },
+        failure: { code: 'cleanup_failed' },
+      });
+      expect(((result.cleanup as Record<string, unknown>).stop as Record<string, unknown>).remaining).toEqual(expect.arrayContaining(['server', 'client-1']));
+      expect(lifecycle.mock.calls.filter(call => call[0] === 'stop')).toHaveLength(2);
+      expect(endTest).toHaveBeenCalledWith('/api/multiplayer-test-end', expect.anything(), 'instance:test/server', expect.any(Number));
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('a recording that cannot start under a job stops the playtest, settles the job and releases the session', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'roblox-cli-stop-record-'));
+    (worker.recordWithWorker as jest.Mock).mockRejectedValue(new Error('Recording output already exists'));
+    try {
+      const { service, lifecycle } = freshPlaytest((bridge) => { disconnectRuntime(bridge); return { success: true }; });
+      await service.open({ source: 'attach' });
+      service.submitTest({ action: 'play', record: join(directory, 'gameplay.mp4'), scenario: { steps: [{ type: 'eval', name: 'check', target: 'client-1', code: 'return true' }] } }, 'record-fails');
+      await service.jobs.settled('record-fails');
+      expect(service.jobs.status('record-fails')).toMatchObject({ state: 'failed', execution: 'failed', phase: 'settled' });
+      expect(service.jobs.hasActive('instance:test')).toBe(false);
+      expect(service.jobs.result('record-fails')).toMatchObject({ outcome: { passed: false }, cleanup: { runtime: 'stopped' }, steps: [] });
+      expect(lifecycle.mock.calls.map(call => call[0])).toEqual(['start', 'status', 'stop']);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    ['wait', { type: 'wait', name: 'long', duration_ms: 600_000 }],
+    ['wait_until', { type: 'wait_until', name: 'long', target: 'client-1', code: 'return false', timeout_ms: 300_000 }],
+  ])('cancel interrupts a long %s promptly and still stops the playtest', async (_type, step) => {
+    const { service, lifecycle } = freshPlaytest((bridge) => { disconnectRuntime(bridge); return { success: true }; });
+    await service.open({ source: 'attach' });
+    service.submitTest({ action: 'play', scenario: { steps: [step] } }, 'long-wait');
+    for (let turn = 0; turn < 1000 && service.jobs.status('long-wait')?.phase !== 'step'; turn++) await new Promise(resolve => setImmediate(resolve));
+    expect(service.jobs.status('long-wait')).toMatchObject({ state: 'running', in_flight: { index: 0 } });
+    const began = Date.now();
+    const settled = await service.jobs.cancel('long-wait');
+    // The cancel answers once teardown is done, in far less than one poll of a human's patience.
+    expect(Date.now() - began).toBeLessThan(2_000);
+    expect(settled).toMatchObject({ state: 'cancelled', phase: 'settled' });
+    expect(service.jobs.hasActive('instance:test')).toBe(false);
+    const result = service.jobs.result('long-wait') as Record<string, unknown>;
+    expect(result).toMatchObject({ passed: false, cancelled: true, cleanup: { runtime: 'stopped' }, steps: [{ passed: false, result: { cancelled: true } }] });
+    expect(lifecycle.mock.calls.map(call => call[0])).toContain('stop');
   });
 });

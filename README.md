@@ -167,8 +167,10 @@ with `{"done":true,"reason":...,"next_cursor":...}` so the caller can resume
 Exit codes follow the error body: `4` when `execution` is `unknown`, `2` for
 usage codes (fix the request), `3` for availability codes (daemon,
 authentication, session, Studio, plugin build, target, or a request Studio
-never took), `1` for any other failure, `0` for success and `130` for
-interruption; `roblox schema` lists the codes under `exit_code_rules`.
+never took), `1` for any other failure, `0` for success, and `130`, `143` or
+`129` when SIGINT, SIGTERM or SIGHUP ends the command (a followed playtest is
+cancelled first; see Durable scenarios); `roblox schema` lists the codes under
+`exit_code_rules`.
 Requests are never automatically replayed. Pass `--request-id ID` on any
 command to resubmit safely: the daemon returns the original outcome, or the
 pending one, instead of running it again. Code is read from stdin only with
@@ -194,6 +196,8 @@ roblox test play --players 2 --scenario tests/qa.json --out evidence/qa
 roblox test play --readiness-attribute GameReady --ready-timeout 180 --keep-open
 roblox record --duration 30 --output evidence/walkthrough.mp4
 roblox test play --scenario tests/qa.json --record evidence/gameplay.mp4
+roblox test play --scenario tests/qa.json --record evidence/gameplay.mp4 --overwrite  # replace it if this run passes
+roblox test play --scenario tests/qa.json --record evidence/demo.mp4 --foreground  # full-rate video; activates Studio
 roblox test calibrate                     # report the play viewport crop for a running client
 roblox test status
 roblox test stop
@@ -229,11 +233,13 @@ native capture for the embedded Mac play client and engine capture for edit
 mode; `--backend native|engine` selects explicitly. Receipts identify the
 instance, peer, window, backend, viewport, time and failed fallback attempts.
 The CLI starts a private Unix-socket capture worker under the invoking
-terminal's Screen Recording permission. This also serves detached jobs, whose
-daemon may lack that permission. The worker accepts only window
-captures, never input or Luau, and exits after five idle minutes with no active
-jobs. Direct HTTP users need daemon Screen Recording permission or an existing
-CLI-started worker. Missing pixels are reported as capture failures.
+terminal's Screen Recording permission. Native window capture runs only there,
+never in the daemon: the detached daemon usually lacks that permission, and
+macOS then refuses `screencapture` with "could not create image from window".
+The worker accepts only window captures, never input or Luau, and exits after
+five idle minutes with no active jobs. Direct HTTP users need an existing
+CLI-started worker for native capture. Missing pixels are reported as capture
+failures.
 
 `--crop viewport` briefly adds four calibration markers, removes them, and
 captures a clean PNG plus the original window. Only a verified marker rectangle
@@ -251,12 +257,26 @@ error; it never silently replaces another test. Set `--readiness-attribute NAME`
 to wait for your game's actual interactive state. A result labeled
 `validation: "startup_only"` proves that peers started, not that the game loaded.
 
-Foreground policy is explicit: `--foreground auto` activates Studio once for
-native input; `never` refuses activation; `required` requests an input focus
-session even for a read-only scenario. Inspection never activates Studio by
-default. A focus lease keeps the display awake and restores the prior app only
-if the owner has not switched apps during the run. Arbitrary eval steps that
-send input must declare `"interactive": true`.
+Studio stays in the background. Scenario input is engine-side virtual input,
+and screenshots and recording capture the Studio window, so a playtest never
+needs Studio in front and never takes the desktop from you: no focus helper
+runs, and nothing wakes the display except a recording. A window that is
+minimized, or a sleeping display, stops Studio rendering; screenshots then fail
+with that reason.
+
+Behind another app Studio throttles its own rendering to about 15 fps. Steps
+and screenshots are unaffected, but a video has about that many distinct frames.
+Every `test play` receipt, its `recording` receipt and the `record` receipt
+report `render_fps`, the rate the visible view (client-1, else edit) actually
+rendered at over the run as counted by the plugin, and add a warning to
+`warnings` when it is below 25. `--foreground` (on `test play`, `test resume`
+and `record`) is the explicit opt-in for a full-rate video: it brings Studio to
+the front once, keeps the display awake for the run, and restores the previous
+app afterwards unless you switched apps meanwhile. When macOS refuses the
+activation (macOS 14+ does while you are working in another app), the command
+fails with `foreground_unavailable` before any playtest starts; click Studio or
+rerun without `--foreground`. A resumed job keeps the choice of its original
+play unless `--foreground` is passed again.
 
 Scenario mouse steps support `move`, `click`, `mouseDown`, and `mouseUp`.
 Keyboard steps default to `tap`; prefer `duration_ms`. Legacy keyboard
@@ -283,12 +303,25 @@ roblox test cancel --job JOB_ID
 roblox test resume --job JOB_ID --detach
 ```
 
-`test play` admits a disk-backed job and prints its ID immediately. The default
-CLI follows short status requests; `--detach` returns after admission. Closing
-the terminal or losing HTTP does not cancel the job. `--timeout` limits waiting,
-not execution. HTTP `POST /v2/commands/test` with `action: play` returns 202;
-`GET /v2/requests/:id` reports progress, and `action: result, job_id: ID` retrieves
-the final receipt. `background: false` retains the older synchronous HTTP form.
+`test play` admits a disk-backed job and prints its ID immediately. By default
+the CLI follows it with short status reads and owns it: SIGINT, SIGTERM or
+SIGHUP (a closed terminal, a killed harness) cancels the job with its full
+teardown before the CLI exits with `130`, `143` or `129` and the settled
+receipt; a second signal stops waiting for that cancel. An explicit
+`--timeout` bounds the followed run the same way: when it passes, the CLI
+cancels the job. `roblox test job --job ID --follow` only watches: a signal
+stops following and leaves the job alone.
+
+The daemon enforces the same rule for a follower that dies without a chance to
+cancel (SIGKILL, a crashed shell): every job is attended unless admitted with
+`--detach`, and an attended job is cancelled, with full teardown, once 30 s
+pass without a status read (`GET /v2/requests/:id`, which every follower
+polls). A session is therefore never left owned by a job nobody follows.
+`--detach` returns after admission and runs the job unattended until it ends
+or `roblox test cancel`; follow it later with `roblox test job --job ID
+--follow`. HTTP `POST /v2/commands/test` with `action: play` always returns
+202 (`detach: true` for unattended); `action: result, job_id: ID` retrieves the
+final receipt. There is no synchronous play request.
 
 Requests, each completed step, earlier attempt receipts and binary artifacts
 are retained under `~/Library/Application Support/roblox-cli/test-jobs/ID/`
@@ -296,17 +329,42 @@ are retained under `~/Library/Application Support/roblox-cli/test-jobs/ID/`
 have no old 256 KiB workflow cap and survive daemon restarts. These directories
 are owner-managed evidence and are not automatically pruned.
 
-Cancellation stops future steps, allows an in-flight native request to settle,
-and releases held input; it does not roll back game state. Daemon interruption
-produces `unknown`, never automatic replay. Resume requires the original live
+`roblox test cancel` interrupts a running `wait`, `wait_until`, readiness wait
+or `--duration` at once, lets an in-flight native action answer (aborting it
+would leave its outcome unknown), then runs the normal teardown: the recorder is
+finalized, held input released, and the playtest stopped and verified. It
+returns once the job has settled, or after 30 s with the current state. A
+`--keep-open` or reused playtest stays running, so its job can resume. Cancel
+does not roll back game state. Daemon interruption produces `unknown`, never
+automatic replay. Resume requires the original live
 peer identities and a satisfied scenario `resume_when`. An interrupted mutating
 step advances only when its declared `expect` proves completion; otherwise
 resume refuses. Read-only steps may be repeated, and interrupted waits retain
-their remaining duration when a receipt exists. Starting a new job on an owned
+their remaining duration when a receipt exists. Each resume is a new attempt
+with its own operation IDs. Starting a new job on an owned
 session is refused until the earlier job settles or is explicitly cancelled.
 Cancelling an interrupted job whose original playtest is gone ends it
 (`cleanup_runtime_gone`) instead of leaving the session owned; a cancel that
 arrives while a resume is validating stops that resume.
+
+A job always settles once its run returns, whatever happened: a failure after
+play started (a recorder that cannot start, a lost transport mid-step) skips
+the remaining steps and still takes the teardown, so the job ends `failed`
+(with `execution: "unknown"` when a step's effect is uncertain) and releases
+the session instead of holding it as `unknown`.
+
+The play receipt separates what the scenario did from how teardown went.
+`outcome` (`passed`, `steps_passed`, `steps_total`) is the scenario's own
+verdict. `cleanup` reports `runtime` (`stopped`, `kept_open`, `still_running`),
+the `stop` attempts, `input_release`, `warnings` and `failures`. Teardown
+stops the playtest through the edit DataModel, retries once, then asks the
+play server itself to `EndTest`; after each attempt it watches the bridge peer
+list, and `runtime: "stopped"` means the server and clients are gone, not that
+a stop RPC answered. A stop RPC that timed out while the runtime still went
+away is a warning; a runtime left running, held input in a live runtime, or a
+requested video that never finalized is a failure. Top-level `passed` is
+`outcome.passed`, not `suspicious`, and `cleanup.passed`; `failure.code` is
+`playtest_failed`, `playtest_suspicious` or `cleanup_failed` accordingly.
 
 Local validation expands all reusable actions and rejects invalid fields,
 units, names and structures before admission. Luau behavior, target availability
@@ -361,7 +419,8 @@ reports whether Studio is connected; it does not claim game readiness.
 On macOS 15+, `record` captures a continuous H.264 MP4 of the Studio window with
 application audio and without microphone input. The native helper is compiled
 by `npm run build`. Output reports measured duration, dimensions, and audio
-track count; capture requests 30 frames per second. The output must not already
+track count; capture requests 30 frames per second, and `render_fps` (when the
+daemon is attached) says how many of those Studio actually rendered. The output must not already
 exist. Screen Recording permission applies to the invoking terminal. A recording failure is reported as a failure, never as a
 successful collection of sparse still frames.
 
@@ -386,20 +445,32 @@ it under one clock. The video starts after the playtest reaches readiness,
 before the first step, and is stopped when the scenario completes, so it covers
 the moment gameplay began through the end of the scenario. The play receipt adds
 a top-level `recording` object (file, measured `duration_seconds`, `width`,
-`height`, `audio_tracks`, `stop_reason`, and the viewport calibration) plus
+`height`, `audio_tracks`, `stop_reason`, `render_fps`, and the viewport calibration) plus
 `timeline`, and writes a `timeline.json` sidecar next to the video. Every
 retained step receipt carries `started_at_ms` and `ended_at_ms` offsets measured
 from the start of the recording, so a reviewer can seek to the frame in which a
-step happened. A recording that cannot start or cannot be finalized fails the
-command: a requested video is not optional evidence.
+step happened. A recording that cannot start fails the run (its steps are
+skipped and the playtest is still stopped), and one that cannot be finalized
+fails it on cleanup: a requested video is not optional evidence.
+
+An existing `--record` file is refused with `output_exists` (exit 2) before
+any job is admitted. `--overwrite` allows it: the recorder always writes a
+fresh sibling (`NAME.recording-XXXXXXXX.mp4`), and only a finalized video of a
+passing run replaces the file, in one rename. Otherwise the previous file
+survives, the new video keeps its sibling name, and `cleanup.warnings` says
+where it is.
 
 `--record` records the play client viewport, not the whole Studio window with
 chrome. The four-marker calibration used by `screenshot --crop viewport` is
 derived once, before the first step, and applied to every recorded frame; the
-calibration receipt is reported beside the video. Calibration failure is never
-silent: the run records the full window and says so in
-`recording.calibration.verified == false` with the reason. `roblox test
-calibrate` reports the same crop for a running client without capturing a still.
+calibration receipt is reported beside the video. A capture that trails the
+marker frame (a background Studio renders slowly) is retaken up to four
+times, and a window or viewport that moves while it is measured (a playtest's
+view settles by a pixel just after it starts) is measured again up to three
+times. Calibration failure is never silent: the run records the full window
+and says so in `recording.calibration.verified == false` with the reason,
+which names what changed. `roblox test calibrate` reports the same crop for a
+running client without capturing a still.
 
 Recording from inside a playtest job is started by the terminal-owned capture
 worker rather than by the daemon. Screen Recording permission belongs to the

@@ -1,5 +1,5 @@
-import { CliUsageError, commandNeedsForeground, commandTimeoutMs, parseCli, run } from '../cli.js';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { CliUsageError, commandTimeoutMs, parseCli, run } from '../cli.js';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -82,23 +82,22 @@ describe('CLI artifact failures', () => {
 });
 
 describe('roblox CLI parser', () => {
-  test('inspection leaves desktop focus alone; interactive play may activate Studio', () => {
-    for (const args of [
-      ['screenshot'], ['screenshot', '--target', 'edit'],
-      ['screenshot', '--target', 'client-1'], ['screenshot', '--native'],
-      ['eval', 'return true'], ['eval', 'return true', '--target', 'client-1'],
-      ['test', 'status'], ['test', 'run', 'return true'],
-    ]) expect(commandNeedsForeground(parseCli(args))).toBe(false);
-    expect(commandNeedsForeground(parseCli(['test', 'play', '--keep-open']))).toBe(false);
-    expect(commandNeedsForeground(parseCli(['test', 'play', '--foreground', 'required', '--keep-open']))).toBe(true);
+  test('--foreground is a boolean opt-in for play, resume and record only', () => {
+    expect(parseCli(['test', 'play', '--keep-open']).options.foreground).toBeUndefined();
+    expect(parseCli(['test', 'play', '--keep-open', '--foreground']).options.foreground).toBe(true);
+    expect(parseCli(['test', 'resume', '--job', 'j', '--foreground']).options.foreground).toBe(true);
+    expect(parseCli(['record', '--duration', '5', '--output', 'a.mp4', '--foreground']).options.foreground).toBe(true);
+    for (const args of [['screenshot', '--foreground'], ['eval', 'return true', '--foreground'], ['test', 'status', '--foreground']])
+      expect(usageError(args).message).toMatch(/--foreground is only valid/);
+    // The removed policy values are not flags any more.
+    expect(() => parseCli(['test', 'play', '--keep-open', '--foreground', 'auto'])).toThrow();
   });
-  test('a scenario deadline includes its waits, duration and lifecycle work', () => {
-    const parsed = parseCli(['test', 'play', '--keep-open']);
-    expect(commandTimeoutMs(parsed, { duration_ms: 90_000, scenario: { steps: [
-      { type: 'wait_until', timeout_ms: 120_000 }, { type: 'keyboard', duration: 4 },
-    ] } })).toBe(424_000);
-    expect(commandTimeoutMs(parseCli(['test', 'play', '--timeout', '20']), {})).toBe(20_000);
-    expect(commandTimeoutMs(parseCli(['open', 'baseplate']), {})).toBe(150_000);
+  test('a playtest is admitted in one short request; an explicit --timeout bounds the followed run', () => {
+    expect(commandTimeoutMs(parseCli(['test', 'play', '--keep-open']))).toBe(45_000);
+    expect(commandTimeoutMs(parseCli(['test', 'play', '--timeout', '20']))).toBe(20_000);
+    // The daemon answers a cancel once teardown settles, or after 30 s.
+    expect(commandTimeoutMs(parseCli(['test', 'cancel', '--job', 'j']))).toBe(45_000);
+    expect(commandTimeoutMs(parseCli(['open', 'baseplate']))).toBe(150_000);
   });
   test('parses the five workflow commands without a generic call escape hatch', () => {
     expect(parseCli(['open', 'baseplate']).command).toBe('open');
@@ -220,13 +219,13 @@ describe('daemon request options', () => {
       .mockImplementation(async () => reply({ target: 'edit', duration_ms: 1 }));
     await run(parseCli(['eval', 'return 1', '--token', 't', '--timeout', '90']));
     expect(sentBody(fetchSpy.mock.calls[0][1])).toMatchObject({ timeout_ms: 90_000 });
-    expect(commandTimeoutMs(eval90, { timeout_ms: 90_000 })).toBe(105_000);
+    expect(commandTimeoutMs(eval90)).toBe(105_000);
     await run(parseCli(['test', 'run', 'return 1', '--token', 't', '--timeout', '1.5']));
     expect(sentBody(fetchSpy.mock.calls[1][1])).toMatchObject({ action: 'run', timeout_ms: 1500 });
-    expect(commandTimeoutMs(parseCli(['test', 'run', 'return 1', '--timeout', '1.5']), {})).toBe(16_500);
+    expect(commandTimeoutMs(parseCli(['test', 'run', 'return 1', '--timeout', '1.5']))).toBe(16_500);
     await run(parseCli(['eval', 'return 1', '--token', 't']));
     expect(sentBody(fetchSpy.mock.calls[2][1])).not.toHaveProperty('timeout_ms');
-    expect(commandTimeoutMs(parseCli(['eval', 'return 1']), {})).toBe(45_000);
+    expect(commandTimeoutMs(parseCli(['eval', 'return 1']))).toBe(45_000);
   });
 
   test('--ready-timeout is the playtest start and readiness timeout', async () => {
@@ -236,6 +235,25 @@ describe('daemon request options', () => {
     const result = await run(parseCli(['test', 'play', '--keep-open', '--detach', '--ready-timeout', '240', '--token', 't']));
     expect(result.code).toBe(0);
     expect(sentBody(fetchSpy.mock.calls[0][1])).toMatchObject({ action: 'play', timeout: 240 });
+  });
+
+  test('an input scenario plays in the background unless --foreground opts in', async () => {
+    const directory = mkdtempSync(`${tmpdir()}/roblox-cli-fg-`);
+    const scenario = `${directory}/input.json`;
+    writeFileSync(scenario, JSON.stringify({ steps: [{ type: 'keyboard', key_code: 'E' }, { type: 'click_gui', path: ['Shop'] }] }));
+    const stderr = jest.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const fetchSpy = jest.spyOn(globalThis, 'fetch')
+      .mockImplementation(async () => reply({ job_id: 'job-1', state: 'queued' }, 202));
+    try {
+      await run(parseCli(['test', 'play', '--scenario', scenario, '--detach', '--token', 't']));
+      expect(sentBody(fetchSpy.mock.calls[0][1]).foreground).toBeUndefined();
+      expect(stderr.mock.calls.flat().join('')).not.toMatch(/--foreground/);
+      await run(parseCli(['test', 'play', '--scenario', scenario, '--detach', '--foreground', '--token', 't']));
+      expect(sentBody(fetchSpy.mock.calls[1][1])).toMatchObject({ foreground: true });
+      expect(stderr.mock.calls.flat().join('')).toMatch(/--foreground: Studio will be brought to the front/);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   test('status --capture-probe asks the daemon to run the capture probe', async () => {
@@ -346,6 +364,65 @@ describe('logs --follow', () => {
   });
 });
 
+describe('a followed playtest job', () => {
+  afterEach(() => jest.restoreAllMocks());
+  const added = (signal: NodeJS.Signals, existing: Set<unknown>) => process.listeners(signal).filter((listener) => !existing.has(listener));
+
+  /** A daemon that admits `job-1`, reports it running, and settles it when cancelled. */
+  function daemon(onStatus: () => void) {
+    const actions: string[] = [];
+    jest.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+      const body = init?.body === undefined ? undefined : sentBody(init);
+      actions.push(String(body?.action ?? 'status'));
+      if (body?.action === 'play') return reply({ job_id: 'job-1', state: 'queued' }, 202);
+      if (body?.action === 'cancel') return reply({ job_id: 'job-1', state: 'cancelled', directory: '/jobs/job-1' });
+      if (body?.action === 'result') return reply({ passed: false, cancelled: true, cleanup: { runtime: 'stopped' } });
+      onStatus();
+      return reply({ job_id: 'job-1', state: 'running', next_step: 0, total_steps: 1 });
+    });
+    return actions;
+  }
+
+  test.each([['SIGINT', 130], ['SIGTERM', 143], ['SIGHUP', 129]] as const)('%s cancels the job this CLI started and reports how it settled', async (signal, code) => {
+    jest.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const existing = new Set<unknown>(process.listeners(signal));
+    // The harness kills the CLI while it follows the job.
+    const actions = daemon(() => { for (const listener of added(signal, existing)) listener(signal); });
+    const result = await run(parseCli(['test', 'play', '--keep-open', '--token', 't']));
+    expect(result.code).toBe(code);
+    expect(result.response).toMatchObject({ job_id: 'job-1', interrupted: signal, cancelled: true, cleanup: { runtime: 'stopped' } });
+    expect(actions).toEqual(['play', 'status', 'cancel', 'result']);
+    expect(added(signal, existing)).toHaveLength(0);
+  });
+
+  test('interrupting test job --follow stops following a job it did not start, without cancelling it', async () => {
+    jest.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const existing = new Set<unknown>(process.listeners('SIGINT'));
+    const actions = daemon(() => { for (const listener of added('SIGINT', existing)) listener('SIGINT'); });
+    const result = await run(parseCli(['test', 'job', '--job', 'job-1', '--follow', '--token', 't']));
+    expect(result).toMatchObject({ code: 130, response: { job_id: 'job-1', following: false, reason: 'SIGINT' } });
+    expect(actions).not.toContain('cancel');
+  });
+
+  test('a detached play installs no signal handling and returns after admission', async () => {
+    jest.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const existing = new Set<unknown>(process.listeners('SIGTERM'));
+    const actions = daemon(() => { throw new Error('a detached play must not follow'); });
+    const result = await run(parseCli(['test', 'play', '--keep-open', '--detach', '--token', 't']));
+    expect(result).toMatchObject({ code: 0, response: { job_id: 'job-1', state: 'queued' } });
+    expect(actions).toEqual(['play']);
+    expect(added('SIGTERM', existing)).toHaveLength(0);
+  });
+
+  test('an explicit --timeout cancels the followed job when it passes', async () => {
+    jest.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const actions = daemon(() => undefined);
+    const result = await run(parseCli(['test', 'play', '--keep-open', '--timeout', '0.001', '--token', 't']));
+    expect(result).toMatchObject({ code: 1, response: { interrupted: 'timeout', cancelled: true } });
+    expect(actions.slice(-2)).toEqual(['cancel', 'result']);
+  });
+});
+
 describe('uncertain HTTP delivery', () => {
   afterEach(()=>jest.restoreAllMocks());
   test('a dropped transport after dispatch retains the original ID and forbids replay', async () => {
@@ -427,11 +504,34 @@ describe('explicit start/stop recording', () => {
 });
 
 describe('scenario recording options', () => {
-  test('--record is a test play option that must name an mp4', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  test('--record is a test play option that must name an mp4; --overwrite needs --record', () => {
     const parsed = parseCli(['test', 'play', '--scenario', 'qa.json', '--record', 'evidence/gameplay.mp4']);
     expect(parsed.options.record).toBe('evidence/gameplay.mp4');
+    expect(parseCli(['test', 'play', '--keep-open', '--record', 'clip.mp4', '--overwrite']).options.overwrite).toBe(true);
     usageError(['test', 'play', '--keep-open', '--record', 'clip.mov']);
     usageError(['screenshot', '--record', 'clip.mp4']);
+    usageError(['test', 'play', '--keep-open', '--overwrite']);
+  });
+
+  test('an existing --record file is refused before any job is created, unless --overwrite', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'roblox-cli-record-'));
+    const file = join(directory, 'demo.mp4');
+    writeFileSync(file, 'previous');
+    jest.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const fetchSpy = jest.spyOn(globalThis, 'fetch').mockImplementation(async () => reply({ job_id: 'job-1', state: 'queued' }, 202));
+    try {
+      const refused = await run(parseCli(['test', 'play', '--keep-open', '--record', file, '--token', 't']));
+      expect(refused).toMatchObject({ code: 2, response: { error: { code: 'output_exists', execution: 'not_started', details: { file } } } });
+      expect(fetchSpy).not.toHaveBeenCalled();
+      const admitted = await run(parseCli(['test', 'play', '--keep-open', '--record', file, '--overwrite', '--detach', '--token', 't']));
+      expect(admitted.code).toBe(0);
+      expect(sentBody(fetchSpy.mock.calls[0][1])).toMatchObject({ action: 'play', record: file, overwrite: true, detach: true });
+      expect(existsSync(file)).toBe(true);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   test('test calibrate measures the visible play client without a --target', () => {

@@ -2,10 +2,18 @@ import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { TestJobs, childRequestId } from '../test-jobs.js';
 import { compileScenario, type Json } from '../scenario.js';
+import { CliCommandError } from '../cli-errors.js';
 import type { ToolInvocationContext } from '../command-results.js';
 const session = () => ({ session_id: 'session-one', instance_id: 'studio-one' });
 const runtime = () => ['client-1:original', 'server:original'];
 const nextTurn = () => new Promise(resolve => setImmediate(resolve));
+/** An execute that runs until its job is cancelled, as a long `wait` does. */
+const untilCancelled = async (_body: Json, context: ToolInvocationContext) => {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  context.job!.cancelSignal.addEventListener('abort', () => resolve());
+  await promise;
+  return { passed: false, cancelled: true };
+};
 describe('persistent native scenario jobs', () => {
   test('long request IDs retain distinct child identities with room for recovery suffixes', () => {
     const prefix = 'x'.repeat(127);
@@ -55,11 +63,80 @@ describe('persistent native scenario jobs', () => {
     }, home);
     jobs.submit({}, compileScenario({ steps: [{ type: 'eval', code: 'return true' }] }), 'cancel');
     await nextTurn();
-    expect(await jobs.cancel('cancel')).toMatchObject({ state: 'cancelling', in_flight: { name: 'feed' } });
+    const cancelling = jobs.cancel('cancel');
+    expect(jobs.status('cancel')).toMatchObject({ state: 'cancelling', in_flight: { name: 'feed' }, cancellation: { reason: 'requested' } });
     finish();
-    await jobs.settled('cancel');
-    expect(jobs.status('cancel')).toMatchObject({ state: 'cancelled', next_step: 1 });
+    // The cancel answers once the run has settled, not merely once it was flagged.
+    expect(await cancelling).toMatchObject({ state: 'cancelled', next_step: 1, phase: 'settled' });
     expect(nextAction).toBe(false);
+  });
+  test('a cancel aborts the job cancel signal at once and answers within its bound when teardown is slow', async () => {
+    jest.useFakeTimers();
+    try {
+      let aborted = false;
+      const jobs = new TestJobs({
+        session, runtime, check: async () => true, execute: async (_body, context) => {
+          context.job!.cancelSignal.addEventListener('abort', () => { aborted = true; });
+          return new Promise(() => { });
+        },
+      }, home, { leaseMs: 60_000, cancelSettleMs: 5_000 });
+      jobs.submit({ detach: true }, compileScenario({ steps: [] }), 'slow-teardown');
+      await jest.advanceTimersByTimeAsync(0);
+      const cancelling = jobs.cancel('slow-teardown');
+      expect(aborted).toBe(true);
+      await jest.advanceTimersByTimeAsync(5_000);
+      expect(await cancelling).toMatchObject({ state: 'cancelling', cancel_requested: true });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+  test('an attended job whose follower stops reading its status is cancelled; a detached job is not', async () => {
+    jest.useFakeTimers();
+    try {
+      const jobs = new TestJobs({ session, runtime, check: async () => true, execute: untilCancelled }, home, { leaseMs: 1_000, cancelSettleMs: 5_000 });
+      jobs.submit({}, compileScenario({ steps: [] }), 'attended');
+      // Status reads renew the lease while the follower is alive.
+      for (let i = 0; i < 5; i++) { await jest.advanceTimersByTimeAsync(600); jobs.observe('attended'); }
+      expect(jobs.status('attended')).toMatchObject({ state: 'running', attended: true });
+      await jest.advanceTimersByTimeAsync(1_000);
+      await jobs.settled('attended');
+      expect(jobs.status('attended')).toMatchObject({ state: 'cancelled', phase: 'settled', cancellation: { reason: 'follower_lost' } });
+      expect(jobs.hasActive('studio-one')).toBe(false);
+      jobs.submit({ detach: true }, compileScenario({ steps: [] }), 'detached');
+      await jest.advanceTimersByTimeAsync(10_000);
+      expect(jobs.status('detached')).toMatchObject({ state: 'running', attended: false });
+      const cancelled = jobs.cancel('detached');
+      await jest.advanceTimersByTimeAsync(0);
+      expect(await cancelled).toMatchObject({ state: 'cancelled', cancellation: { reason: 'requested' } });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+  test('a run that throws after reaching its runtime is recovered, settles and frees the session', async () => {
+    const recover = jest.fn(async () => ({ released: true, runtime: 'stopped' }));
+    const jobs = new TestJobs({
+      session, runtime, check: async () => true, recover, execute: async (_body, context) => {
+        context.job!.ready(runtime());
+        throw new Error('transport lost mid-run');
+      },
+    }, home);
+    jobs.submit({ keep_open: false }, compileScenario({ steps: [] }), 'thrown');
+    await jobs.settled('thrown');
+    expect(recover).toHaveBeenCalledWith(expect.objectContaining({ keep_open: false }), runtime());
+    expect(jobs.status('thrown')).toMatchObject({ state: 'failed', execution: 'unknown', phase: 'settled' });
+    expect(jobs.result('thrown')).toMatchObject({ passed: false, recovery: { runtime: 'stopped' }, error: { message: expect.stringContaining('transport lost') } });
+    expect(jobs.hasActive('studio-one')).toBe(false);
+  });
+  test('a run that fails before play settles as not started without recovery', async () => {
+    const recover = jest.fn();
+    const jobs = new TestJobs({
+      session, runtime, check: async () => true, recover, execute: async () => { throw new CliCommandError('invalid_scenario', 'preflight rejected'); },
+    }, home);
+    jobs.submit({}, compileScenario({ steps: [] }), 'preflight');
+    await jobs.settled('preflight');
+    expect(recover).not.toHaveBeenCalled();
+    expect(jobs.status('preflight')).toMatchObject({ state: 'failed', execution: 'not_started' });
+    expect(jobs.hasActive('studio-one')).toBe(false);
   });
   test('cancelling queued work sends no input and retains a final result', async () => {
     const execute = jest.fn();
@@ -120,7 +197,7 @@ describe('persistent native scenario jobs', () => {
     expect(() => jobs.status('../escape')).toThrow(/Invalid job/);
     expect(() => jobs.status('..')).toThrow(/Invalid job/);
   });
-  test('cleanup uncertainty remains unknown even after the final step completed', async () => {
+  test('an uncertain run settles as failed with execution unknown and frees the session', async () => {
     const jobs = new TestJobs({
       session, runtime, check: async () => true, execute: async (_b, c) => {
         c.job!.ready(runtime());
@@ -131,13 +208,15 @@ describe('persistent native scenario jobs', () => {
     }, home);
     jobs.submit({}, compileScenario({ steps: [{ type: 'eval', code: 'return true' }] }), 'cleanup-unknown');
     await jobs.settled('cleanup-unknown');
-    expect(jobs.status('cleanup-unknown')).toMatchObject({ state: 'unknown', execution: 'unknown', next_step: 1 });
+    expect(jobs.status('cleanup-unknown')).toMatchObject({ state: 'failed', execution: 'unknown', next_step: 1 });
+    expect(jobs.hasActive('studio-one')).toBe(false);
   });
   test('read-only cancellation resumes only the remaining wait and retains previous receipts', async () => {
     let runs = 0;
     const execute = jest.fn(async (body: Json, c: ToolInvocationContext) => {
       c.job!.ready(runtime());
       if (runs++ === 0) {
+        expect(c.requestId).toBe('wait-resume');
         c.job!.stepStarted(0, { name: 'pause' });
         c.job!.stepFinished(0, { name: 'pause', passed: false, result: { requested_ms: 1000, waited_ms: 600 } });
         return { passed: false, steps: [] };
@@ -145,7 +224,10 @@ describe('persistent native scenario jobs', () => {
       expect((body.scenario as {
         steps: Json[];
       }).steps[0].duration_ms).toBe(400);
-      expect(body.foreground).toBe('never');
+      expect(body.foreground).toBe(false);
+      // A resumed attempt gets its own operation ids, so re-running step 0
+      // cannot collide with the first attempt's retained operations.
+      expect(c.requestId).toBe('wait-resume:attempt-2');
       c.job!.stepStarted(0, { name: 'pause' });
       c.job!.stepFinished(0, { name: 'pause', passed: true });
       return { passed: true, steps: [] };
@@ -153,9 +235,9 @@ describe('persistent native scenario jobs', () => {
     const jobs = new TestJobs({ session, runtime, execute, check: async () => true, cleanup: async () => ({ released: true }) }, home);
     jobs.submit({}, compileScenario({ resume_when: { code: 'return true' }, steps: [{ name: 'pause', type: 'wait', duration_ms: 1000 }] }), 'wait-resume');
     await jobs.settled('wait-resume');
-    await jobs.resume('wait-resume', 'never');
+    await jobs.resume('wait-resume', { foreground: false });
     await jobs.settled('wait-resume');
-    expect(jobs.status('wait-resume')).toMatchObject({ state: 'completed' });
+    expect(jobs.status('wait-resume')).toMatchObject({ state: 'completed', attempt: 2 });
     const { readdirSync } = await import('node:fs');
     expect(readdirSync(`${home}/wait-resume`).filter(x => x.includes('.previous-'))).toHaveLength(2);
   });
@@ -207,7 +289,9 @@ describe('persistent native scenario jobs', () => {
   });
   test('a restored cancellation of a job that never reached its runtime no longer owns the session', async () => {
     const original = await interrupt('restored', false);
-    await original.cancel('restored');
+    // The daemon dies while this cancel waits for a run that never settles;
+    // the request is already on disk.
+    void original.cancel('restored');
     const jobs = new TestJobs({ session, runtime, check: async () => true, execute: async () => ({ passed: true }) }, home);
     expect(jobs.status('restored')).toMatchObject({ state: 'cancelled', execution: 'stopped', cancellation_cleanup: { reason: 'original_runtime_gone' } });
     jobs.submit({}, compileScenario({ steps: [] }), 'next');

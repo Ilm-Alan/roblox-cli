@@ -46,10 +46,13 @@ import {
   type RecordingCrop,
 } from './native-recording.js';
 import { artifactsDirectory, DEFAULT_PORT, dataDirectory } from './paths.js';
-import { compileScenario, scenarioNeedsInput } from './scenario.js';
+import { compileScenario } from './scenario.js';
 import { ensureCaptureWorker } from './capture-worker.js';
+import { renderSample } from './render-rate.js';
 
 type JsonObject = Record<string, unknown>;
+
+const FOREGROUND_NOTICE = '--foreground: Studio will be brought to the front for a full-rate capture; the previous app is restored afterwards unless you switch apps meanwhile.\n';
 
 export interface CliOptions {
   port: number;
@@ -88,8 +91,9 @@ export interface CliOptions {
   readyTimeoutSeconds?: number;
   help: boolean;
   detach?: boolean;
+  overwrite?: boolean;
   jobId?: string;
-  foreground?: string;
+  foreground?: boolean;
   checks?: string;
   backend?: string;
   crop?: string;
@@ -240,6 +244,8 @@ export function parseCli(argv: string[]): ParsedCli {
       continue;
     }
     if (token === '--detach') { options.detach = true; continue; }
+    if (token === '--overwrite') { options.overwrite = true; continue; }
+    if (token === '--foreground') { options.foreground = true; continue; }
     if (token === '--native') {
       options.nativeCapture = true;
       continue;
@@ -260,7 +266,7 @@ export function parseCli(argv: string[]): ParsedCli {
       ['--focus', 'focus'], ['--format', 'format'], ['--cursor', 'cursor'],
       ['--filter', 'filter'], ['--until', 'until'], ['--scope', 'scope'], ['--request-id', 'requestId'],
       ['--readiness-attribute', 'readinessAttribute'], ['--record', 'record'],
-      ['--job', 'jobId'], ['--foreground', 'foreground'], ['--checks', 'checks'], ['--backend', 'backend'], ['--crop', 'crop'],
+      ['--job', 'jobId'], ['--checks', 'checks'], ['--backend', 'backend'], ['--crop', 'crop'],
     ];
     const stringOption = stringOptions.find(([name]) => token === name || token.startsWith(`${name}=`));
     if (stringOption) {
@@ -385,6 +391,7 @@ export function parseCli(argv: string[]): ParsedCli {
   if (options.keepOpen && !testPlay) throw invalid('--keep-open is only valid for test play');
   if (options.record !== undefined && !testPlay) throw invalid('--record is only valid for test play');
   if (options.record !== undefined && !options.record.endsWith('.mp4')) throw invalid('--record must name a .mp4 file');
+  if (options.overwrite && (!testPlay || options.record === undefined)) throw invalid('--overwrite requires test play --record FILE.mp4');
   for (const [value, name] of [
     [options.focus, '--focus'], [options.format, '--format'], [options.quality, '--quality'],
     [options.output, '--output'],
@@ -444,7 +451,7 @@ export function parseCli(argv: string[]): ParsedCli {
   if (options.revision !== undefined && command !== 'open') throw invalid('--revision is only valid for open');
   if (options.detach && !(command === 'test' && ['play', 'resume'].includes(subcommand ?? ''))) throw invalid('--detach requires test play or resume');
   if (options.jobId && !(command === 'test' && ['job', 'cancel', 'resume'].includes(subcommand ?? ''))) throw invalid('--job requires test job, cancel or resume');
-  if (options.foreground && (!['auto', 'never', 'required'].includes(options.foreground) || !(command === 'record' || (command === 'test' && ['play', 'resume'].includes(subcommand ?? ''))))) throw invalid('--foreground must be auto, never or required for test play, test resume or record');
+  if (options.foreground && !(command === 'record' || (command === 'test' && ['play', 'resume'].includes(subcommand ?? '')))) throw invalid('--foreground is only valid for test play, test resume or record');
   if (options.checks && !(command === 'test' && subcommand === 'diagnose')) throw invalid('--checks requires test diagnose');
   if (options.crop && options.crop !== 'viewport') throw invalid('--crop must be viewport');
   if (options.crop && command !== 'screenshot' && !(command === 'record-studio' && subcommand === 'start')) {
@@ -468,6 +475,8 @@ async function requestJson(
   options: CliOptions,
   body?: JsonObject,
   requestId: string = randomUUID(),
+  /** Stops waiting for the reply (the request may already have been delivered). */
+  abandon?: AbortSignal,
 ): Promise<{ response: unknown; requestId: string }> {
   let token = options.token;
   let tokenProblem = 'the token is empty';
@@ -497,7 +506,7 @@ async function requestJson(
             [REQUEST_ID_HEADER]: requestId,
           },
         body: body === undefined ? undefined : JSON.stringify(body),
-        signal: controller.signal,
+        signal: abandon === undefined ? controller.signal : AbortSignal.any([controller.signal, abandon]),
       });
     } catch (error) {
       if (isConnectionRefused(error)) {
@@ -506,9 +515,11 @@ async function requestJson(
           execution: 'not_started', retry: 'after_fix', next: 'roblox daemon start',
         }), undefined, 'not_executed');
       }
-      const message = error instanceof Error && error.name === 'AbortError'
-        ? `request exceeded ${options.timeoutMs / 1000}s; outcome unknown`
-        : `roblox-cli transport failed; outcome unknown: ${error instanceof Error ? error.message : String(error)}`;
+      const message = abandon?.aborted
+        ? 'stopped waiting for the reply; outcome unknown'
+        : error instanceof Error && error.name === 'AbortError'
+          ? `request exceeded ${options.timeoutMs / 1000}s; outcome unknown`
+          : `roblox-cli transport failed; outcome unknown: ${error instanceof Error ? error.message : String(error)}`;
       const requestError = failure(new Error(message), undefined, undefined, 'unknown');
       requestError.requestId = requestId;
       throw requestError;
@@ -637,16 +648,17 @@ function commandBody(parsed: ParsedCli): JsonObject {
       if (scenario !== undefined) compileScenario(scenario);
       if (parsed.subcommand === 'validate') return { action: 'validate', scenario };
       return {
-        action: 'play', background: true, foreground: options.foreground ?? 'auto', mode: options.mode, players: options.players, duration_ms: options.durationMs,
+        action: 'play', detach: options.detach === true, foreground: options.foreground, mode: options.mode, players: options.players, duration_ms: options.durationMs,
         scenario, test_args: options.testArgs, keep_open: options.keepOpen,
         readiness_attribute: options.readinessAttribute, instance_id: options.instanceId,
         timeout: options.readyTimeoutSeconds,
         record: options.record === undefined ? undefined : resolve(options.record),
+        overwrite: options.overwrite,
       };
     }
     if (['job', 'cancel', 'resume'].includes(parsed.subcommand)) {
       if (!options.jobId) throw invalid('--job ID is required');
-      return { action: parsed.subcommand === 'job' ? 'result' : parsed.subcommand, job_id: options.jobId, foreground: options.foreground };
+      return { action: parsed.subcommand === 'job' ? 'result' : parsed.subcommand, job_id: options.jobId, foreground: options.foreground, detach: parsed.subcommand === 'resume' ? options.detach === true : undefined };
     }
     if (parsed.subcommand === 'diagnose') return { action: 'diagnose', target: options.target ?? 'client-1', checks: options.checks?.split(','), duration_ms: options.durationMs, readiness_attribute: options.readinessAttribute };
     if (parsed.subcommand === 'calibrate') return { action: 'calibrate', instance_id: options.instanceId };
@@ -844,7 +856,12 @@ function thrownErrorResult(error: unknown): { code: number; response: { error: J
   return { code: exitCodeForError(response.error), response };
 }
 
-export function commandTimeoutMs(parsed: ParsedCli, request: JsonObject): number {
+/**
+ * HTTP deadline of one command request. A playtest is never one long request:
+ * it is admitted in one short call and followed by short status reads, so its
+ * explicit `--timeout` bounds the whole followed run instead (see followJob).
+ */
+export function commandTimeoutMs(parsed: ParsedCli): number {
   if (parsed.options.timeoutExplicit) {
     // Eval and test run send --timeout as the Studio execution deadline, so
     // the HTTP wait must outlast it for the daemon to report the outcome.
@@ -852,27 +869,9 @@ export function commandTimeoutMs(parsed: ParsedCli, request: JsonObject): number
     return codeCommand ? parsed.options.timeoutMs + EXECUTION_RESPONSE_MARGIN_MS : parsed.options.timeoutMs;
   }
   if (parsed.command === 'open') return 150_000;
-  if (parsed.command !== 'test' || parsed.subcommand !== 'play') return parsed.options.timeoutMs;
-  // Include startup, readiness, final evidence, teardown and every bounded step.
-  // A scenario's HTTP connection must outlive the work it asked Studio to do.
-  let budget = 180_000 + (typeof request.duration_ms === 'number' ? request.duration_ms : 0);
-  const scenario = request.scenario as { steps?: JsonObject[] } | undefined;
-  for (const step of scenario?.steps ?? []) {
-    if (!step || typeof step !== 'object') continue;
-    if (step.type === 'wait') budget += Number(step.duration_ms ?? step.duration ?? 0);
-    else if (step.type === 'wait_until') budget += Number(step.timeout_ms ?? 30_000);
-    else if (step.type === 'keyboard') budget += Number(step.duration ?? 0) * 1000 + 30_000;
-    else budget += 45_000;
-  }
-  return Number.isFinite(budget) ? Math.max(180_000, budget) : 180_000;
-}
-
-export function commandNeedsForeground(parsed: ParsedCli): boolean {
-  if (parsed.options.foreground === 'never') return false;
-  if (parsed.options.foreground === 'required') return true;
-  if (parsed.command !== 'test' || parsed.subcommand !== 'play') return false;
-  const scenario = commandBody(parsed).scenario;
-  return scenario !== undefined && scenarioNeedsInput(compileScenario(scenario));
+  // The daemon answers a cancel once the job's teardown settles, or after 30 s.
+  if (parsed.command === 'test' && parsed.subcommand === 'cancel') return CANCEL_REQUEST_MS;
+  return parsed.options.timeoutMs;
 }
 
 async function remoteCommand(parsed: ParsedCli): Promise<{ code: number; response: unknown }> {
@@ -888,108 +887,213 @@ async function remoteCommand(parsed: ParsedCli): Promise<{ code: number; respons
       return { code: exitCodeForError(response.error), response };
     }
   }
+  // An existing video is refused before any job exists or play starts; the
+  // daemon checks again at admission for callers that skip the CLI.
+  if (options.record !== undefined && !options.overwrite && existsSync(resolve(options.record))) {
+    const file = resolve(options.record);
+    const response = cliError('output_exists', `--record already exists: ${file}. Choose another path, or pass --overwrite to replace it when the run passes.`, {
+      execution: 'not_started', retry: 'after_fix', details: { file },
+    });
+    return { code: exitCodeForError(response.error), response };
+  }
   if (parsed.command === 'open' && !options.timeoutExplicit) options.timeoutMs = 120_000;
   const request = commandBody(parsed);
   if (parsed.command === 'test' && parsed.subcommand === 'validate') {
     const compiled = compileScenario(request.scenario);
-    return { code: 0, response: { valid: true, steps: compiled.steps, warnings: compiled.warnings, fingerprint: compiled.fingerprint, requires_input: scenarioNeedsInput(compiled) } };
+    return { code: 0, response: { valid: true, steps: compiled.steps, warnings: compiled.warnings, fingerprint: compiled.fingerprint } };
   }
-  if (parsed.command === 'test' && parsed.subcommand === 'play' && commandNeedsForeground(parsed)) {
-    process.stderr.write('Interactive scenario: Studio may be activated once; subsequent owner app switches will be respected.\n');
-  }
-  if (parsed.command === 'test' && parsed.subcommand === 'resume' && options.foreground !== 'never') {
-    process.stderr.write('Resuming follows the job foreground policy; interactive steps may activate Studio once.\n');
-  }
-  options.timeoutMs = commandTimeoutMs(parsed, request);
-  if (parsed.command === 'screenshot' || (parsed.command === 'test' && ['play', 'resume'].includes(parsed.subcommand ?? ''))) {
+  if (options.foreground) process.stderr.write(FOREGROUND_NOTICE);
+  options.timeoutMs = commandTimeoutMs(parsed);
+  // Native capture runs only in the terminal-owned worker, which holds this
+  // terminal's Screen Recording permission; calibration captures too.
+  if (parsed.command === 'screenshot' || (parsed.command === 'test' && ['play', 'resume', 'calibrate'].includes(parsed.subcommand ?? ''))) {
     try { await ensureCaptureWorker(); } catch (error) { process.stderr.write(`Native capture worker unavailable: ${String(error)}\n`); }
   }
-  let response: unknown;
-  let requestId: string = options.requestId ?? randomUUID();
+  // A CLI that follows a job it started owns that job: a termination signal
+  // cancels it, with its full teardown, before the CLI exits. The handlers go
+  // in before admission, so a signal that lands mid-request is not lost.
+  const owner = parsed.command === 'test' && ['play', 'resume'].includes(parsed.subcommand ?? '') && options.detach !== true;
+  const following = owner || (parsed.command === 'test' && parsed.subcommand === 'job' && options.follow);
+  const signals = following ? watchSignals() : undefined;
   try {
-    const endpoint = parsed.command === 'close' ? 'open' : parsed.command;
-    const result = parsed.command === 'test' && parsed.subcommand === 'job'
-      ? await requestJson(`${AGENT_REQUESTS_PREFIX}/${encodeURIComponent(options.jobId!)}`, options)
-      : await requestJson(
-        `${AGENT_COMMAND_PREFIX}/${endpoint}`,
-        parsed.command === 'test' && parsed.subcommand === 'play' ? { ...options, timeoutMs: 15000 } : options,
-        request,
-        requestId,
-      );
-    response = result.response;
-    requestId = result.requestId;
-  } catch (error) {
-    return requestFailureResult(error, requestId);
-  }
-  if (parsed.command === 'test' && response && typeof response === 'object' && 'job_id' in response) {
-    const jobId = String((response as JsonObject).job_id);
-    if (parsed.subcommand !== 'job' && parsed.subcommand !== 'cancel') process.stderr.write(JSON.stringify({ job_id: jobId, state: (response as JsonObject).state, next: `roblox test job --job ${jobId} --follow` }) + '\n');
-    if (options.detach || parsed.subcommand === 'cancel' || (parsed.subcommand === 'job' && !options.follow)) return { code: 0, response };
-    try { response = await waitForJob(jobId, options, requestId); }
-    catch (error) { return requestFailureResult(error, jobId); }
-  }
-
-  const shouldRetain = options.out !== undefined || parsed.command === 'screenshot'
-    || options.output !== undefined || containsInlineArtifact(response)
-    || (parsed.command === 'test' && parsed.subcommand === 'play' && shouldAutomaticallyRetainPlaytestEvidence(response));
-  if (shouldRetain) {
-    const out = options.out ? resolve(options.out) : artifactDirectory(parsed.command, requestId);
-    const automaticEvidence = options.out === undefined
-      && parsed.command === 'test'
-      && parsed.subcommand === 'play'
-      && shouldAutomaticallyRetainPlaytestEvidence(response);
+    let response: unknown;
+    let code: number | undefined;
+    let requestId: string = options.requestId ?? randomUUID();
     try {
-      response = retain(out, {
-        protocol: AGENT_PROTOCOL_VERSION,
-        command: parsed.command, subcommand: parsed.subcommand, request,
-        request_id: requestId, created_at: new Date().toISOString(),
-      }, response, options.output);
-      if (automaticEvidence && response && typeof response === 'object' && !Array.isArray(response)) {
-        response = { ...(response as JsonObject), evidence_directory: out };
-      }
+      const endpoint = parsed.command === 'close' ? 'open' : parsed.command;
+      const result = parsed.command === 'test' && parsed.subcommand === 'job'
+        ? await requestJson(`${AGENT_REQUESTS_PREFIX}/${encodeURIComponent(options.jobId!)}`, options)
+        : await requestJson(
+          `${AGENT_COMMAND_PREFIX}/${endpoint}`,
+          parsed.command === 'test' && parsed.subcommand === 'play' ? { ...options, timeoutMs: 15000 } : options,
+          request,
+          requestId,
+        );
+      response = result.response;
+      requestId = result.requestId;
     } catch (error) {
-      const commandPassed = responseOk(response);
-      response = cliError('artifact_failed', error instanceof Error ? error.message : String(error), {
-        execution: 'unknown', retry: 'never', request_id: requestId,
-        next: `The command already completed. Recover its receipt with roblox status --request-id ${requestId}; do not replay it.`,
-        details: { command_completed: true, command_passed: commandPassed },
-      });
-      return { code: responseExitCode(response), response };
+      return requestFailureResult(error, requestId);
     }
+    if (parsed.command === 'test' && response && typeof response === 'object' && 'job_id' in response) {
+      const jobId = String((response as JsonObject).job_id);
+      if (parsed.subcommand !== 'job' && parsed.subcommand !== 'cancel') process.stderr.write(JSON.stringify({ job_id: jobId, state: (response as JsonObject).state, next: `roblox test job --job ${jobId} --follow` }) + '\n');
+      if (signals === undefined) return { code: 0, response };
+      try { ({ response, code } = await followJob(jobId, options, owner, signals)); }
+      catch (error) { return requestFailureResult(error, jobId); }
+    }
+
+    const shouldRetain = options.out !== undefined || parsed.command === 'screenshot'
+      || options.output !== undefined || containsInlineArtifact(response)
+      || (parsed.command === 'test' && parsed.subcommand === 'play' && shouldAutomaticallyRetainPlaytestEvidence(response));
+    if (shouldRetain) {
+      const out = options.out ? resolve(options.out) : artifactDirectory(parsed.command, requestId);
+      const automaticEvidence = options.out === undefined
+        && parsed.command === 'test'
+        && parsed.subcommand === 'play'
+        && shouldAutomaticallyRetainPlaytestEvidence(response);
+      try {
+        response = retain(out, {
+          protocol: AGENT_PROTOCOL_VERSION,
+          command: parsed.command, subcommand: parsed.subcommand, request,
+          request_id: requestId, created_at: new Date().toISOString(),
+        }, response, options.output);
+        if (automaticEvidence && response && typeof response === 'object' && !Array.isArray(response)) {
+          response = { ...(response as JsonObject), evidence_directory: out };
+        }
+      } catch (error) {
+        const commandPassed = responseOk(response);
+        response = cliError('artifact_failed', error instanceof Error ? error.message : String(error), {
+          execution: 'unknown', retry: 'never', request_id: requestId,
+          next: `The command already completed. Recover its receipt with roblox status --request-id ${requestId}; do not replay it.`,
+          details: { command_completed: true, command_passed: commandPassed },
+        });
+        return { code: responseExitCode(response), response };
+      }
+    }
+    return { code: code ?? responseExitCode(response), response };
+  } finally {
+    signals?.dispose();
   }
-  return { code: responseExitCode(response), response };
 }
 
-async function waitForJob(id: string, options: CliOptions, _submissionId: string): Promise<unknown> {
+/** The daemon answers a cancel once the job's teardown settles, or after 30 s. */
+const CANCEL_REQUEST_MS = 45_000;
+/** Exit status of a CLI ended by a termination signal: 128 + the signal number. */
+const FOLLOW_SIGNALS: Record<'SIGHUP' | 'SIGINT' | 'SIGTERM', number> = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };
+type FollowSignal = keyof typeof FOLLOW_SIGNALS;
+
+interface SignalWatch {
+  /** Aborted by the first termination signal: stop following. */
+  readonly stop: AbortSignal;
+  /** Aborted by a second signal: stop waiting, even for the cancel. */
+  readonly abandon: AbortSignal;
+  received(): FollowSignal | undefined;
+  dispose(): void;
+}
+
+/**
+ * Turn SIGINT, SIGTERM and SIGHUP into a request to stop following instead of
+ * an immediate exit, so the CLI can cancel the job it started first.
+ */
+function watchSignals(): SignalWatch {
+  const stop = new AbortController();
+  const abandon = new AbortController();
+  let received: FollowSignal | undefined;
+  const listeners = (Object.keys(FOLLOW_SIGNALS) as FollowSignal[]).map((name) => {
+    const listener = () => {
+      if (received === undefined) { received = name; stop.abort(); }
+      else abandon.abort();
+    };
+    process.on(name, listener);
+    return [name, listener] as const;
+  });
+  // A closed terminal turns stdio writes into EPIPE/EIO errors, which must not
+  // kill the process before it has cancelled its job.
+  const ignore = () => undefined;
+  process.stdout.on('error', ignore);
+  process.stderr.on('error', ignore);
+  return {
+    stop: stop.signal,
+    abandon: abandon.signal,
+    received: () => received,
+    dispose: () => {
+      for (const [name, listener] of listeners) process.removeListener(name, listener);
+      process.stdout.removeListener('error', ignore);
+      process.stderr.removeListener('error', ignore);
+    },
+  };
+}
+
+/**
+ * Follow a job with short status reads until it settles. Every read renews an
+ * attended job's lease on the daemon. When `own` (this CLI started the job), a
+ * termination signal or the explicit `--timeout` cancels the job and reports
+ * how it settled; otherwise the CLI only stops following.
+ */
+async function followJob(id: string, options: CliOptions, own: boolean, signals: SignalWatch): Promise<{ response: unknown; code?: number }> {
   const deadline = options.timeoutExplicit ? Date.now() + options.timeoutMs : Infinity;
   const short = { ...options, timeoutMs: 15_000 };
   let prior = '';
-  while (Date.now() < deadline) {
+  for (;;) {
+    const signal = signals.received();
+    if (signal !== undefined || Date.now() >= deadline) {
+      if (own) return cancelFollowedJob(id, options, signals, signal ?? 'timeout');
+      if (signal !== undefined) return { code: FOLLOW_SIGNALS[signal], response: { job_id: id, following: false, reason: signal, next: `roblox test job --job ${id} --follow` } };
+      const timeout = failure(new Error(`Stopped following job ${id}; the job continues. Inspect its status before taking another action.`), undefined, undefined, 'unknown');
+      timeout.requestId = id; throw timeout;
+    }
     let status: JsonObject;
     try {
       const reply = await requestJson(`${AGENT_REQUESTS_PREFIX}/${encodeURIComponent(id)}`, short);
       if (!reply.response || typeof reply.response !== 'object') throw new Error('Job status is unavailable');
       status = reply.response as JsonObject;
     } catch (error) {
-      const lost = failure(new Error(`Lost contact with job ${id}; its execution may continue: ${String(error)}`), undefined, undefined, 'unknown');
+      const fate = own ? 'the daemon cancels it once 30 s pass without a status read' : 'its execution may continue';
+      const lost = failure(new Error(`Lost contact with job ${id}; ${fate}: ${String(error)}`), undefined, undefined, 'unknown');
       lost.requestId = id; throw lost;
     }
     const progress = JSON.stringify({ job_id: id, state: status.state, next_step: status.next_step, total_steps: status.total_steps, in_flight: status.in_flight });
     if (options.follow && progress !== prior) { process.stderr.write(progress + '\n'); prior = progress; }
     if (!['queued', 'running', 'cancelling'].includes(String(status.state))) {
-      if (status.state === 'unknown') return { ...status, error: { code: 'job_interrupted', execution: 'unknown', retry: 'never', message: 'Inspect the retained job and its live session before resuming.', request_id: id } };
+      if (status.state === 'unknown') return { response: { ...status, error: { code: 'job_interrupted', execution: 'unknown', retry: 'never', message: 'Inspect the retained job and its live session before resuming.', request_id: id } } };
       try {
         const result = await requestJson(`${AGENT_COMMAND_PREFIX}/test`, short, { action: 'result', job_id: id });
-        return { ...result.response as JsonObject, job_id: id, job_directory: status.directory };
+        return { response: { ...result.response as JsonObject, job_id: id, job_directory: status.directory } };
       } catch (error) {
         const lost = failure(new Error(`Could not retrieve the result for job ${id}: ${String(error)}`), undefined, undefined, 'unknown');
         lost.requestId = id; throw lost;
       }
     }
-    await new Promise(resolve => setTimeout(resolve, 250));
+    await delay(Math.max(0, Math.min(250, deadline - Date.now())), undefined, { signal: signals.stop }).catch(() => undefined);
   }
-  const timeout = failure(new Error(`Stopped waiting for job ${id}; the job continues. Inspect its status before taking another action.`), undefined, undefined, 'unknown');
-  timeout.requestId = id; throw timeout;
+}
+
+/**
+ * Cancel the job this CLI started and wait (bounded by the daemon) for it to
+ * settle, so an interrupted CLI never leaves a session owned by a job nobody
+ * follows. The receipt is the settled result when there is one.
+ */
+async function cancelFollowedJob(id: string, options: CliOptions, signals: SignalWatch, reason: FollowSignal | 'timeout'): Promise<{ response: unknown; code: number }> {
+  process.stderr.write(JSON.stringify({ job_id: id, cancelling: true, reason }) + '\n');
+  let status: JsonObject;
+  try {
+    const reply = await requestJson(`${AGENT_COMMAND_PREFIX}/test`, { ...options, timeoutMs: CANCEL_REQUEST_MS }, { action: 'cancel', job_id: id }, undefined, signals.abandon);
+    status = reply.response && typeof reply.response === 'object' ? reply.response as JsonObject : {};
+  } catch (error) {
+    const response = cliError('job_cancel_unconfirmed', `Stopped by ${reason}; the cancel of job ${id} was not confirmed: ${error instanceof Error ? error.message : String(error)}`, {
+      execution: 'unknown', retry: 'never', request_id: id,
+      next: `roblox test cancel --job ${id} (an attended job is also cancelled once 30 s pass without a status read)`,
+    });
+    return { code: reason === 'timeout' ? exitCodeForError(response.error) : FOLLOW_SIGNALS[reason], response };
+  }
+  let response: JsonObject = { ...status, interrupted: reason, next: `roblox test job --job ${id} --follow` };
+  if (!['queued', 'running', 'cancelling', 'unknown'].includes(String(status.state))) {
+    try {
+      const result = await requestJson(`${AGENT_COMMAND_PREFIX}/test`, { ...options, timeoutMs: 15_000 }, { action: 'result', job_id: id }, undefined, signals.abandon);
+      response = { ...result.response as JsonObject, job_id: id, job_directory: status.directory, interrupted: reason };
+    } catch { /* The settled status above is still the honest answer. */ }
+  }
+  return { code: reason === 'timeout' ? responseExitCode(response) : FOLLOW_SIGNALS[reason], response };
 }
 
 /** Every log entry message in an instance- or group-scope logs response. */
@@ -1079,8 +1183,18 @@ async function localCommand(parsed: ParsedCli): Promise<{ code: number; response
     if (parsed.command === 'schema') return { code: 0, response: agentSchema() };
     if (parsed.command === 'record') {
       if (options.durationMs === undefined || !options.output) throw invalid('record requires --duration SECONDS --output FILE.mp4');
-      if (options.foreground !== 'never') process.stderr.write('Recording may activate Studio once and will respect subsequent owner app switches.\n');
-      return { code: 0, response: await recordNativeStudio(options.durationMs / 1000, options.output, options.foreground) };
+      if (options.foreground) process.stderr.write(FOREGROUND_NOTICE);
+      // The daemon, when one is attached, measures the rate Studio rendered at
+      // over the capture; without it the receipt simply has no render_fps.
+      const sampleRender = async () => {
+        try {
+          const status = (await requestJson(`${AGENT_COMMAND_PREFIX}/test`, { ...options, timeoutMs: 10_000 }, { action: 'status' })).response;
+          return status && typeof status === 'object' && 'runtime_health' in status ? renderSample(status.runtime_health) : undefined;
+        } catch {
+          return undefined;
+        }
+      };
+      return { code: 0, response: await recordNativeStudio(options.durationMs / 1000, options.output, { foreground: options.foreground, sampleRender }) };
     }
     // The explicit start/stop form exists so a workflow owns the length of its
     // own video instead of a fixed-duration ceiling. `stop` signals the helper
@@ -1095,6 +1209,7 @@ async function localCommand(parsed: ParsedCli): Promise<{ code: number; response
         // the markers in the live play client.
         let crop: RecordingCrop | undefined;
         if (options.crop === 'viewport') {
+          await ensureCaptureWorker();
           const calibrated = await requestJson(`${AGENT_COMMAND_PREFIX}/test`, options, { action: 'calibrate' });
           const measured = calibrated.response && typeof calibrated.response === 'object' && !Array.isArray(calibrated.response)
             ? calibrated.response as JsonObject

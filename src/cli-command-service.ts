@@ -1,13 +1,13 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, linkSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { BridgeService, PublicStudioInstance } from './bridge-service.js';
-import { evaluationError, normalizeCommandResult, publicEvaluation, publicRequestStatus } from './command-results.js';
+import { evaluationError, normalizeCommandResult, publicEvaluation, publicRequestStatus, publicToolErrorBody } from './command-results.js';
 import type { ToolInvocationContext } from './command-results.js';
 import { CliCommandError } from './cli-errors.js';
 import { dataDirectory } from './paths.js';
-import { compileScenario, validateDiagnostics, scenarioNeedsInput, type Scenario, type Condition } from './scenario.js';
+import { compileScenario, validateDiagnostics, type Scenario, type Condition } from './scenario.js';
 import { TestJobs, childRequestId } from './test-jobs.js';
 import { targetingProbe, diagnosticProbe } from './native-probes.js';
 import { acquireFocus } from './focus-session.js';
@@ -15,6 +15,7 @@ import { captureFrame } from './capture-pipeline.js';
 import { recordingStatus } from './native-recording.js';
 import { startScenarioRecording, writeTimeline, type ScenarioRecordingSession, type TimelineEntry } from './scenario-recording.js';
 import { calibratedViewportRect } from './viewport-capture.js';
+import { renderReceipt, renderSample, type RenderReceipt, type RenderSample } from './render-rate.js';
 import type { RobloxStudioTools } from './tools/index.js';
 
 type JsonObject = Record<string, unknown>;
@@ -144,6 +145,116 @@ function isFailure(value: unknown): boolean {
   return body.error !== undefined || body.isError === true || body.success === false || body.ok === false || body.passed === false;
 }
 
+type Bounded = <T>(label: string, ms: number, work: Promise<T>) => Promise<T | undefined>;
+
+/** How long each stop attempt waits for the runtime peers to disconnect. */
+const STOP_CONFIRM_MS = 10_000;
+/** Deadline and peer-wait of a stop retry; the first attempt uses the play timeout. */
+const STOP_RETRY_DEADLINE_MS = 45_000;
+const STOP_RETRY_WAIT_SECONDS = 15;
+const SERVER_END_TEST_TIMEOUT_MS = 15_000;
+
+interface StopAttempt extends JsonObject {
+  method: 'playtest_stop' | 'server_end_test';
+  ok: boolean;
+  error?: string;
+}
+
+/** A stop is `confirmed` by the bridge's peer list, never by a stop reply alone. */
+interface RuntimeStop extends JsonObject {
+  confirmed: boolean;
+  attempts: StopAttempt[];
+  /** Runtime roles still connected when the attempts ran out. */
+  remaining: string[];
+}
+
+/**
+ * How a run's teardown went, reported beside the scenario `outcome` so a
+ * cleanup problem never masquerades as a scenario failure or vice versa.
+ * `failures` fail the run (no video, a runtime left alive, input held in a
+ * live runtime); `warnings` do not (a stop RPC that timed out after the
+ * runtime was already gone).
+ */
+interface PlayCleanup extends JsonObject {
+  passed: boolean;
+  /** `unverified` only when teardown never reached the stop. */
+  runtime: 'unverified' | 'kept_open' | 'stopped' | 'still_running';
+  stop?: RuntimeStop;
+  input_release?: unknown;
+  warnings: string[];
+  failures: string[];
+  deadlines?: JsonObject[];
+}
+
+function stopError(reply: unknown): string {
+  const body = asObject(reply);
+  return [body.error, body.detail ?? body.message].filter(part => typeof part === 'string').join(': ') || JSON.stringify(reply);
+}
+
+/**
+ * The context a wait or read-only poll runs under: it also aborts when the
+ * job is cancelled, so a cancel ends a long `wait`/`wait_until` at once.
+ * Native actions keep the plain context and are allowed to answer, because
+ * aborting one mid-flight would leave its outcome unknown.
+ */
+function cancellable(context?: ToolInvocationContext): ToolInvocationContext | undefined {
+  return context?.job ? { ...context, signal: AbortSignal.any([context.signal, context.job.cancelSignal]) } : context;
+}
+
+interface RecordingTarget {
+  /** The path the caller asked for. */
+  file: string;
+  overwrite: boolean;
+  /** A fresh sibling the recorder writes; moved onto `file` once finalized. */
+  partial: string;
+}
+
+/**
+ * Validate a play request's `record` destination. An existing file is refused
+ * at admission, before any job or playtest exists, unless `overwrite` asks to
+ * replace it. The recorder always writes a fresh sibling that is moved into
+ * place only once finalized, so a failed run never destroys or half-writes
+ * the previous video.
+ */
+function recordingTarget(body: JsonObject, options: { allowExisting?: boolean } = {}): RecordingTarget | undefined {
+  if (body.overwrite !== undefined && typeof body.overwrite !== 'boolean') throw new CliCommandError('invalid_argument', 'overwrite must be a boolean.');
+  if (body.record === undefined) {
+    if (body.overwrite !== undefined) throw new CliCommandError('invalid_argument', 'overwrite requires record.');
+    return undefined;
+  }
+  const file = requiredString(body.record, 'record');
+  if (!isAbsolute(file) || !file.endsWith('.mp4')) throw new CliCommandError('invalid_argument', 'record must be an absolute path ending in .mp4.');
+  const overwrite = body.overwrite === true;
+  if (!overwrite && options.allowExisting !== true && existsSync(file)) {
+    throw new CliCommandError('output_exists', `Recording output already exists: ${file}. Choose another path, or pass --overwrite to replace it when the run passes.`, { details: { file } });
+  }
+  return { file, overwrite, partial: join(dirname(file), `${basename(file, '.mp4')}.recording-${randomUUID().slice(0, 8)}.mp4`) };
+}
+
+/**
+ * Move a finalized recording onto its requested path. With `overwrite` and a
+ * passing run the move is one rename, so the destination is never
+ * half-written. Otherwise an existing file is never replaced: the new video
+ * stays beside it and the warning names where.
+ */
+function placeRecording(target: RecordingTarget, runPassed: boolean): { file: string; warning?: string } {
+  try {
+    if (target.overwrite && runPassed) renameSync(target.partial, target.file);
+    else {
+      linkSync(target.partial, target.file);
+      unlinkSync(target.partial);
+    }
+    return { file: target.file };
+  } catch (error) {
+    const reason = (error as NodeJS.ErrnoException).code !== 'EEXIST'
+      ? `the video could not be moved to ${target.file} (${error instanceof Error ? error.message : String(error)})`
+      : target.overwrite
+        ? `${target.file} was kept because this run did not pass`
+        : `${target.file} appeared during the run and was not replaced`;
+    return { file: target.partial, warning: `${reason}; this run's video is ${target.partial}` };
+  }
+}
+
 function isSuspiciousRuntimeHealth(value: unknown): boolean {
   const body = asObject(value);
   const health = body.runtime_health ?? body.runtimeHealth;
@@ -166,6 +277,23 @@ const WAIT_UNTIL_POLL_MS = 50;
 // a retained result has no payload to shape, so older targets are not needed.
 const EVALUATION_TARGET_LIMIT = 1024;
 const TEST_MODES = ['run', 'play', 'status', 'stop', 'cancel', 'resume', 'result', 'validate', 'diagnose', 'calibrate'] as const;
+
+/**
+ * Each sub-operation a command starts gets its own bridge request id. A bridge
+ * id names exactly one operation, so reusing the command's id (a job id, or an
+ * HTTP request id) for a second evaluation is refused as a collision. The
+ * nonce keeps ids unique when a resumed job repeats the same sub-operation.
+ */
+function subOperations(context: ToolInvocationContext | undefined, label: string): () => ToolInvocationContext | undefined {
+  if (context?.requestId === undefined) return () => context;
+  const parent = context.requestId;
+  const nonce = randomUUID().slice(0, 8);
+  let count = 0;
+  return () => {
+    const suffix = `:${label}-${nonce}-${count++}`;
+    return { ...context, requestId: parent.slice(0, 128 - suffix.length) + suffix };
+  };
+}
 
 function numberField(value: unknown, name: string, options: { integer?: boolean; min?: number; max?: number } = {}): number | undefined {
   if (value === undefined) return undefined;
@@ -395,6 +523,7 @@ export class CliCommandService {
       execute: (body, context) => this.testPlay(body, context),
       check: async (check) => (await this.runWaitUntil({ ...check, timeout_ms: Math.min(check.timeout_ms ?? 1000, 5000) })).passed === true,
       cleanup: body => this.releaseScenarioInput(body.scenario as Scenario),
+      recover: (body, runtime) => this.recoverRuntime(body, runtime),
     });
   }
 
@@ -423,8 +552,10 @@ export class CliCommandService {
     const players = numberField(body.players, 'players', { integer: true, min: 1, max: 8 }) ?? 1;
     if (body.mode === 'run' && players > 1) throw new CliCommandError('invalid_argument', 'Run mode is solo only.');
     numberField(body.duration_ms, 'duration_ms', { integer: true, min: 0, max: 86_400_000 });
-    if (body.foreground !== undefined && !['auto', 'never', 'required'].includes(String(body.foreground))) throw new CliCommandError('invalid_argument', 'foreground must be auto, never or required.');
+    if (body.foreground !== undefined && typeof body.foreground !== 'boolean') throw new CliCommandError('invalid_argument', 'foreground must be a boolean.');
     if (body.scenario === undefined && body.duration_ms === undefined && body.keep_open !== true) throw new CliCommandError('invalid_argument', 'test play requires duration, scenario or keep_open.');
+    if (body.detach !== undefined && typeof body.detach !== 'boolean') throw new CliCommandError('invalid_argument', 'detach must be a boolean.');
+    recordingTarget(body);
     const scenario = compileScenario(body.scenario ?? { steps: [] });
     return this.jobs.submit(body, scenario, id);
   }
@@ -782,7 +913,7 @@ export class CliCommandService {
     if (action === 'run') return this.testRun(body, context);
     if (action === 'play') return this.testPlay(body, context);
     if (action === 'cancel') return this.jobs.cancel(requiredString(body.job_id, 'job_id'));
-    if (action === 'resume') return this.jobs.resume(requiredString(body.job_id, 'job_id'), body.foreground === undefined ? undefined : requiredString(body.foreground, 'foreground'));
+    if (action === 'resume') return this.jobs.resume(requiredString(body.job_id, 'job_id'), { foreground: body.foreground, detach: body.detach });
     if (action === 'result') return this.jobs.result(requiredString(body.job_id, 'job_id'));
     if (action === 'validate') {
       const compiled = compileScenario(body.scenario);
@@ -873,23 +1004,32 @@ return {passed=#failures==0,failures=failures}`;
         if (check.passed !== true) throw new CliCommandError('invalid_scenario', 'Native preflight rejected the scenario before input or play control.', { details: check });
       }
     }
-    const focus = await acquireFocus(String(body.foreground ?? 'auto'), scenarioNeedsInput(scenario));
+    const foreground = body.foreground === true;
+    const focus = await acquireFocus(foreground);
     let start: unknown;
     let startAttempted = false;
     const steps: JsonObject[] = [];
     let executionUnknown = false;
     let passed = false;
     let suspicious = false;
+    /** A failure that escaped the run before teardown; reported, never rethrown. */
+    let fault: JsonObject | undefined;
     let evidence: JsonObject = { focus: focus.receipt };
     let lastProbe: JsonObject | undefined;
     let lastScreenshot: unknown;
     let statusBeforeTeardown: unknown;
-    let stop: unknown;
+    let renderStart: RenderSample | undefined;
+    let render: RenderReceipt | undefined;
     let recording: ScenarioRecordingSession | undefined;
     let recorded: JsonObject | undefined;
     let timelineFile: { file: string; entries: number } | undefined;
     const timeline: TimelineEntry[] = [];
-    const recordFile = body.record === undefined ? undefined : requiredString(body.record, 'record');
+    const recordTarget = recordingTarget(body, { allowExisting: true });
+    const recordFile = recordTarget?.file;
+    const cancelled = () => context?.job?.cancelled() === true;
+    const cleanup: PlayCleanup = { passed: true, runtime: 'unverified', warnings: [], failures: [] };
+    /** The scenario's own verdict: startup, readiness, recording start, every step and the duration. */
+    let scenarioPassed = false;
     try {
       context?.job?.phase('starting');
       startAttempted = !reusedPlaytest;
@@ -905,7 +1045,7 @@ return {passed=#failures==0,failures=failures}`;
       }
       passed = start !== undefined && !isFailure(start);
       if (passed) context?.job?.ready(this.runtimeIdentity());
-      if (passed && readinessAttribute) {
+      if (passed && readinessAttribute && !cancelled()) {
         const readiness = await this.runWaitUntil({
           type: 'wait_until',
           target: mode === 'run' ? 'server' : 'client-1',
@@ -913,23 +1053,27 @@ return {passed=#failures==0,failures=failures}`;
           timeout_ms: timeout * 1000,
           stable_frames: 2,
           instance_id: session.instance_id,
-        }, context);
+        }, subOperations(context, 'readiness')());
         evidence.readiness = readiness;
         passed = readiness.passed === true;
       }
+      // The render-rate span starts where a video would: after readiness and
+      // before the first step.
+      if (passed && !cancelled()) renderStart = await this.sampleRender(session.instance_id, context);
       // The video starts after readiness and before the first step, so it
       // covers the moment gameplay began through the end of the scenario.
-      if (recordFile !== undefined) {
-        if (!passed) {
-          evidence.recording = { requested: true, started: false, reason: 'playtest did not reach a ready state' };
+      if (recordTarget !== undefined) {
+        if (!passed || cancelled()) {
+          evidence.recording = { requested: true, started: false, reason: cancelled() ? 'the job was cancelled before recording started' : 'playtest did not reach a ready state' };
           passed = false;
         }
         else {
           context?.job?.phase('recording');
           try {
+            const calibration = subOperations(context, 'calibrate');
             recording = await startScenarioRecording(
-              { file: recordFile },
-              async code => asObject(asObject(await this.evaluate({ target: 'client-1', code, instance_id: session.instance_id }, context)).result),
+              { file: recordTarget.partial },
+              async code => asObject(asObject(await this.evaluate({ target: 'client-1', code, instance_id: session.instance_id }, calibration())).result),
               { ...(session.place_name === undefined ? {} : { placeName: session.place_name }) },
             );
             evidence.recording = {
@@ -940,15 +1084,16 @@ return {passed=#failures==0,failures=failures}`;
             };
           }
           catch (error) {
-            // A recording that never started must fail the command: a caller
+            // A recording that never started fails the command: a caller
             // asking for a video has not received one just because the
-            // scenario steps succeeded.
+            // scenario steps succeeded. The steps are skipped and the run goes
+            // straight to teardown, so the playtest is stopped and the job
+            // settles instead of holding the session.
             evidence.recording = {
               requested: true, started: false,
               failure: error instanceof Error ? error.message : String(error),
             };
             passed = false;
-            throw error;
           }
         }
       }
@@ -1034,8 +1179,9 @@ return {passed=#failures==0,failures=failures}`;
           }
         }
       }
-      if (passed && durationMs !== undefined) await this.runScenarioStep({ type: 'wait', duration_ms: durationMs }, context);
-      if (context?.job?.cancelled()) passed = false;
+      if (passed && durationMs !== undefined && !cancelled()) await this.runScenarioStep({ type: 'wait', duration_ms: durationMs }, context);
+      if (cancelled()) passed = false;
+      scenarioPassed = passed;
 
       // Read health before teardown. A test can have completed its assertions
       // while the renderer or CaptureService is already unhealthy; that is a
@@ -1055,6 +1201,7 @@ return {passed=#failures==0,failures=failures}`;
         passed = false;
         evidence.status_error = error instanceof Error ? error.message : String(error);
       }
+      render = renderReceipt(renderStart, renderSample(asObject(statusBeforeTeardown).runtime_health), foreground);
 
       try {
         const logResult = parseToolResult(await this.logs({ instance_id: session.instance_id, scope: 'auto', tail: 100 }, context));
@@ -1065,7 +1212,8 @@ return {passed=#failures==0,failures=failures}`;
         evidence.logs_error = error instanceof Error ? error.message : String(error);
       }
 
-      if (!passed || suspicious) {
+      // A cancel is not a failure to diagnose; it goes straight to teardown.
+      if ((!passed || suspicious) && !cancelled()) {
         if (evidence.status === undefined && statusBeforeTeardown !== undefined) {
           evidence.status = statusBeforeTeardown;
         }
@@ -1090,6 +1238,14 @@ return {passed=#failures==0,failures=failures}`;
           }
         }
       }
+    } catch (error) {
+      // Nothing that fails once play control began may escape testPlay: the
+      // teardown below still runs, and the job settles with this receipt
+      // instead of an interrupted job that keeps owning the session.
+      passed = false;
+      scenarioPassed = false;
+      if (!(error instanceof CliCommandError) || error.outcome === 'unknown') executionUnknown = true;
+      fault = asObject(publicToolErrorBody('test', error).error);
     } finally {
       // Every teardown await is bounded. Teardown runs in a `finally`, so one
       // await that never settles here would leave the job in `cleanup` forever
@@ -1099,65 +1255,65 @@ return {passed=#failures==0,failures=failures}`;
       const onTimeout = (label: string, ms: number) => { expired.push({ step: label, deadline_ms: ms }); };
       const bounded = <T>(label: string, ms: number, work: Promise<T>) => withDeadline(label, ms, work, onTimeout);
       try {
-      context?.job?.phase('cleanup');
-      // Stop the recorder before tearing the playtest down. Teardown runs in a `finally`, so one
-      // await that never settles here would leave the job in `cleanup` forever
-      // and keep the session owned - a wedged CI run. Expiry is recorded as
-      // evidence, never as silent success.
-      // Stop the recorder before tearing the playtest down: the last thing the
-      // video should show is the end of the scenario, not an empty edit view
-      // after the client closed.
-      if (recording !== undefined) {
-        try {
+        context?.job?.phase('cleanup');
+        // Stop the recorder before tearing the playtest down: the last thing the
+        // video should show is the end of the scenario, not an empty edit view
+        // after the client closed.
+        if (recording !== undefined && recordTarget !== undefined) {
+          let finalizeError: string | undefined;
           // Finalizing writes and fsyncs a whole MP4, so it gets the longest
           // deadline but still a deadline.
-          const finished = await bounded('recording_finalize', 90_000, recording.finish(context?.job?.cancelled() ? 'cancelled' : 'scenario_completed'));
+          const finished = await bounded('recording_finalize', 90_000, recording.finish(cancelled() ? 'cancelled' : 'scenario_completed').catch((error: unknown) => {
+            finalizeError = error instanceof Error ? error.message : String(error);
+            return undefined;
+          }));
           if (finished === undefined) {
-            evidence.recording = { ...asObject(evidence.recording), recorded: false, finalize_failure: 'the recorder did not finalize within 90s' };
+            // A video that cannot be finalized is not evidence: the run fails
+            // on its cleanup, while its scenario outcome stands as measured.
+            const reason = finalizeError ?? 'the recorder did not finalize within 90s';
+            evidence.recording = { ...asObject(evidence.recording), recorded: false, finalize_failure: reason };
+            cleanup.failures.push(`recording_not_finalized: ${reason}`);
           }
           else {
-            recorded = asObject(finished);
-            evidence.recording = { ...asObject(evidence.recording), recorded: true, receipt: recorded };
-            // Persist the video's own evidence now, before any later teardown
-            // step can fail: a caller must never lose a finalized recording
-            // because stopping the playtest went wrong afterwards.
-            if (recordFile !== undefined) {
-              const written = writeTimeline({
-                file: recordFile, clock: recording.clock, recorded, calibration: recording.calibration, steps: timeline,
-                outcome: { passed, execution: passed ? 'success' : 'failed', steps_passed: timeline.filter(entry => entry.passed).length, steps_total: timeline.length },
+            const placed = placeRecording(recordTarget, scenarioPassed);
+            if (placed.warning !== undefined) cleanup.warnings.push(placed.warning);
+            recorded = { ...asObject(finished), file: placed.file, ...(render ?? {}) };
+            evidence.recording = { ...asObject(evidence.recording), file: placed.file, recorded: true, receipt: recorded };
+            // Persist the video's own evidence now, before the playtest stop:
+            // a caller must never lose a finalized recording because stopping
+            // the playtest went wrong afterwards. A sidecar that cannot be
+            // written must not skip that stop either.
+            try {
+              timelineFile = writeTimeline({
+                file: placed.file, clock: recording.clock, recorded, calibration: recording.calibration, steps: timeline,
+                outcome: { passed: scenarioPassed, steps_passed: timeline.filter(entry => entry.passed).length, steps_total: timeline.length },
               });
-              timelineFile = written;
+            } catch (error) {
+              cleanup.warnings.push(`timeline.json was not written: ${error instanceof Error ? error.message : String(error)}`);
             }
           }
         }
-        catch (error) {
-          // A video that cannot be finalized is not evidence. Fail the command
-          // rather than reporting a scenario that quietly produced no file.
-          passed = false;
-          evidence.recording = {
-            ...asObject(evidence.recording), recorded: false,
-            finalize_failure: error instanceof Error ? error.message : String(error),
-          };
+        if (scenario) {
+          cleanup.input_release = await bounded('input_release', 45_000, this.releaseScenarioInput(scenario))
+            ?? { released: false, error: 'input release exceeded 45s' };
         }
-      }
-      if (scenario) {
-        evidence.input_cleanup = await bounded('input_release', 45_000, this.releaseScenarioInput(scenario));
-        if (asObject(evidence.input_cleanup).released !== true) { passed = false; executionUnknown = true; }
-      }
-      // Stop even after a partially successful start. Studio can have runtime
-      // peers connected while the start helper reports a timeout or transport
-      // error, and leaving those peers alive would violate the CLI's one-test
-      // session semantics.
-      if (!keepOpen && startAttempted && !context?.job?.cancelled() && !executionUnknown) {
-        try {
-          const ended = await bounded('playtest_stop', (timeout + 30) * 1000, multiplayer
-            ? this.tools.multiplayerPlaytest('end', players, undefined, undefined, 'roblox-cli-test-finished', timeout, session.instance_id)
-            : this.tools.soloPlaytest('stop', undefined, timeout, session.instance_id));
-          stop = ended === undefined
-            ? { error: `Stopping the playtest exceeded ${timeout + 30}s; the runtime may still be alive.` }
-            : parseToolResult(ended);
-          if (isFailure(stop)) {
-            passed = false;
+        // Stop even after a failed start, a cancel or an uncertain step: Studio
+        // can have runtime peers connected while the start helper reports a
+        // timeout, and a job must never leave behind a runtime nobody follows.
+        // Only an explicitly kept or reused playtest stays up.
+        if (keepOpen || !startAttempted) {
+          cleanup.runtime = 'kept_open';
+        }
+        else {
+          const stopped = await this.stopRuntime(session.instance_id, { multiplayer, players, timeout }, bounded);
+          cleanup.stop = stopped;
+          cleanup.runtime = stopped.confirmed ? 'stopped' : 'still_running';
+          const refused = stopped.attempts.filter(attempt => attempt.ok !== true);
+          if (stopped.confirmed && refused.length > 0) {
+            cleanup.warnings.push(`a stop request failed, but the runtime peers are confirmed gone: ${refused.map(attempt => attempt.error).join('; ')}`);
+          }
+          if (!stopped.confirmed) {
+            cleanup.failures.push(`runtime_not_confirmed_stopped: ${stopped.remaining.join(', ')} still connected after ${stopped.attempts.length} stop attempts`);
             if (evidence.status === undefined && statusBeforeTeardown !== undefined) evidence.status = statusBeforeTeardown;
             if (evidence.probe === undefined) {
               evidence.probe = lastProbe ?? {
@@ -1167,46 +1323,39 @@ return {passed=#failures==0,failures=failures}`;
             }
             if (evidence.screenshot === undefined) {
               try {
-                // A failed stop can leave the runtime peers alive. Preserve a
-                // final frame before returning the teardown failure.
+                // The runtime is still alive; preserve its final frame.
                 evidence.screenshot = await this.screenshot({ instance_id: session.instance_id });
               } catch (error) {
                 evidence.screenshot_error = error instanceof Error ? error.message : String(error);
               }
             }
           }
-        } catch (error) {
-          passed = false;
-          stop = { error: error instanceof Error ? error.message : String(error) };
-          if (evidence.status === undefined && statusBeforeTeardown !== undefined) evidence.status = statusBeforeTeardown;
-          if (evidence.probe === undefined) {
-            evidence.probe = lastProbe ?? {
-              type: 'runtime_health',
-              result: asObject(statusBeforeTeardown).runtime_health ?? null,
-            };
-          }
-          if (evidence.screenshot === undefined) {
-            try {
-              evidence.screenshot = await this.screenshot({ instance_id: session.instance_id });
-            } catch (captureError) {
-              evidence.screenshot_error = captureError instanceof Error ? captureError.message : String(captureError);
-            }
-          }
         }
-      }
+        // Held input only matters while the runtime holding it lives on.
+        if (cleanup.input_release !== undefined && asObject(cleanup.input_release).released !== true) {
+          if (cleanup.runtime === 'stopped') cleanup.warnings.push('held input could not be released, but the runtime holding it is stopped');
+          else cleanup.failures.push('input_release_unverified: held input may still be pressed in the running playtest');
+        }
       } finally {
         evidence.focus_release = await bounded('focus_release', 10_000, focus.release());
-        if (expired.length) evidence.cleanup_deadlines = expired;
+        if (expired.length) cleanup.deadlines = expired;
       }
     }
 
-
+    cleanup.passed = cleanup.failures.length === 0;
+    const verdict = passed && cleanup.passed;
+    const failure = verdict ? undefined
+      : fault !== undefined ? { code: String(fault.code), message: String(fault.message) }
+      : !scenarioPassed ? { code: 'playtest_failed', message: cancelled() ? 'The job was cancelled.' : 'Playtest QA failed.' }
+      : suspicious ? { code: 'playtest_suspicious', message: 'Every step passed, but runtime health was suspicious at teardown.' }
+      : { code: 'cleanup_failed', message: `Every step passed, but cleanup failed: ${cleanup.failures.join('; ')}` };
+    const warnings = [...(scenario?.warnings ?? []), ...(render?.warning === undefined ? [] : [render.warning])];
     return {
-      passed,
+      passed: verdict,
       mode: 'play',
-      execution: executionUnknown ? 'unknown' : passed ? 'success' : 'failed',
-      ...(context?.job?.cancelled() ? { cancelled: true } : {}),
-      ...(scenario?.warnings.length ? { warnings: scenario.warnings } : {}),
+      execution: executionUnknown ? 'unknown' : verdict ? 'success' : 'failed',
+      ...(cancelled() ? { cancelled: true } : {}),
+      ...(warnings.length ? { warnings } : {}),
       play_mode: mode,
       players,
       kept_open: keepOpen || reusedPlaytest,
@@ -1214,8 +1363,17 @@ return {passed=#failures==0,failures=failures}`;
       validation: scenario?.steps.length ? 'scenario' : readinessAttribute ? 'readiness' : 'startup_only',
       duration_ms: Date.now() - startedAt,
       start: publicLifecycle(start),
+      // What the scenario itself did, independent of how teardown went.
+      outcome: {
+        passed: scenarioPassed,
+        steps_passed: steps.filter(step => step.passed === true).length,
+        steps_total: scenario?.steps.length ?? 0,
+        ...(fault === undefined ? {} : { error: fault }),
+      },
       steps,
+      cleanup,
       evidence,
+      ...(render === undefined ? {} : { render_fps: render.render_fps }),
       // The recording receipt is a top-level field, not a buried detail: a
       // reviewer should not have to know where the daemon stashed it.
       ...(recorded === undefined ? {} : {
@@ -1225,8 +1383,7 @@ return {passed=#failures==0,failures=failures}`;
       capture_requested: scenario?.steps.some(step => step.type === 'screenshot') === true || evidence.screenshot !== undefined || evidence.screenshot_error !== undefined,
       capture_passed: steps.every(step => asObject(step.result).capture_passed !== false) && evidence.screenshot_error === undefined,
       ...(suspicious ? { suspicious: true } : {}),
-      ...(stop === undefined ? {} : { stop: publicLifecycle(stop) }),
-      ...(passed ? {} : { failure: { code: 'playtest_failed', message: 'Playtest QA failed.' } }),
+      ...(failure === undefined ? {} : { failure }),
     };
   }
 
@@ -1239,8 +1396,10 @@ return {passed=#failures==0,failures=failures}`;
     if (type === 'wait') {
       const ms = numberField(item.duration_ms ?? item.duration, 'duration_ms', { integer: true, min: 0, max: 86_400_000 }) ?? 0;
       const began = Date.now();
-      const deadline = began + ms;
-      while (Date.now() < deadline && !context?.job?.cancelled()) await waitFor(Math.min(100, deadline - Date.now()), context?.signal);
+      // A cancel ends the wait at once; the receipt keeps how long it ran, so
+      // a resume waits only for the remainder.
+      try { await waitFor(ms, cancellable(context)?.signal); }
+      catch (error) { if (!context?.job?.cancelled()) throw error; }
       return { waited_ms: Date.now() - began, requested_ms: ms, ...(context?.job?.cancelled() ? { passed: false, cancelled: true } : {}) };
     }
     if (type === 'wait_until') return this.runWaitUntil(item, context);
@@ -1293,6 +1452,7 @@ return {passed=#failures==0,failures=failures}`;
     const requiredStableFrames = numberField(item.stable_samples ?? item.stable_frames, 'stable_samples', { integer: true, min: 1, max: 600 }) ?? 1;
     const startedAt = Date.now();
     const deadline = startedAt + timeoutMs;
+    const poll = cancellable(context);
     let attempts = 0;
     let stableFrames = 0;
     let lastEvaluation: JsonObject | undefined;
@@ -1301,9 +1461,9 @@ return {passed=#failures==0,failures=failures}`;
     while (Date.now() <= deadline && !context?.job?.cancelled()) {
       attempts += 1;
       try {
-        const evaluationContext = context?.requestId
-          ? { ...context, requestId: childRequestId(`${context.requestId}:poll`, attempts) }
-          : context;
+        const evaluationContext = poll?.requestId
+          ? { ...poll, requestId: childRequestId(`${poll.requestId}:poll`, attempts) }
+          : poll;
         const evaluation = asObject(await this.evaluate({ ...probe, code, target }, evaluationContext));
         lastEvaluation = evaluation;
         lastError = undefined;
@@ -1329,6 +1489,8 @@ return {passed=#failures==0,failures=failures}`;
           };
         }
       } catch (error) {
+        // A cancelled poll is a read-only probe abandoned on purpose.
+        if (context?.job?.cancelled()) break;
         if (context?.signal.aborted) throw error;
         if (!(error instanceof CliCommandError) || error.code !== 'evaluation_failed') throw error;
         stableFrames = 0;
@@ -1337,13 +1499,16 @@ return {passed=#failures==0,failures=failures}`;
 
       const remainingMs = deadline - Date.now();
       if (remainingMs <= 0) break;
-      await waitFor(Math.min(Number(item.interval_ms ?? WAIT_UNTIL_POLL_MS), remainingMs), context?.signal);
+      try { await waitFor(Math.min(Number(item.interval_ms ?? WAIT_UNTIL_POLL_MS), remainingMs), poll?.signal); }
+      catch (error) { if (!context?.job?.cancelled()) throw error; }
     }
 
+    const cancelledWait = context?.job?.cancelled() === true;
     return {
       passed: false,
       condition: false,
-      timed_out: true,
+      timed_out: !cancelledWait,
+      ...(cancelledWait ? { cancelled: true } : {}),
       target,
       stable_samples: stableFrames,
       stable_frames: stableFrames,
@@ -1353,6 +1518,87 @@ return {passed=#failures==0,failures=failures}`;
       ...(lastEvaluation === undefined ? {} : { evaluation: lastEvaluation }),
       ...(lastError === undefined ? {} : { last_error: lastError }),
     };
+  }
+
+  /** Roles of the runtime peers (play server and clients) connected in an instance's scope. */
+  private runtimeRoles(instanceId: string): string[] {
+    return this.bridge.getPeersInScope(instanceId)
+      .filter(peer => peer.role === 'server' || /^client-\d+$/u.test(peer.role))
+      .map(peer => peer.role);
+  }
+
+  /** Whether every runtime peer disconnects within `ms`. */
+  private async runtimeGone(instanceId: string, ms: number): Promise<boolean> {
+    const deadline = Date.now() + ms;
+    while (this.runtimeRoles(instanceId).length > 0) {
+      if (Date.now() >= deadline) return false;
+      const { promise, resolve } = Promise.withResolvers<void>();
+      setTimeout(resolve, 250);
+      await promise;
+    }
+    return true;
+  }
+
+  /**
+   * Stop a job's playtest and prove it stopped.
+   *
+   * A stop reply is not proof either way: the edit peer's stop RPC can time
+   * out after EndTest already tore the runtime down, and can report success
+   * while peers linger. Every attempt is therefore followed by watching the
+   * bridge's peer list for the server and clients to disconnect. The edit-side
+   * stop is tried twice; the last attempt asks the play server itself to
+   * EndTest, bypassing the edit DataModel's settings relay.
+   */
+  private async stopRuntime(instanceId: string, plan: { multiplayer: boolean; players: number; timeout: number }, bounded: Bounded): Promise<RuntimeStop> {
+    const attempts: StopAttempt[] = [];
+    for (const [index, method] of (['playtest_stop', 'playtest_stop', 'server_end_test'] as const).entries()) {
+      const deadlineMs = index === 0 ? (plan.timeout + 30) * 1000 : STOP_RETRY_DEADLINE_MS;
+      const request = method === 'server_end_test'
+        ? this.endTestOnServer(instanceId)
+        : this.requestStop(instanceId, plan, index === 0 ? plan.timeout : STOP_RETRY_WAIT_SECONDS);
+      const reply = await bounded(`${method}_${index + 1}`, deadlineMs, request.catch((error: unknown) => ({ error: error instanceof Error ? error.message : String(error) })));
+      if (reply === undefined) attempts.push({ method, ok: false, error: `no reply within ${deadlineMs / 1000}s` });
+      else if (isFailure(reply)) attempts.push({ method, ok: false, error: stopError(reply) });
+      else attempts.push({ method, ok: true });
+      if (await this.runtimeGone(instanceId, STOP_CONFIRM_MS)) return { confirmed: true, attempts, remaining: [] };
+    }
+    return { confirmed: false, attempts, remaining: this.runtimeRoles(instanceId) };
+  }
+
+  private async requestStop(instanceId: string, plan: { multiplayer: boolean; players: number }, waitSeconds: number): Promise<unknown> {
+    return parseToolResult(plan.multiplayer
+      ? await this.tools.multiplayerPlaytest('end', plan.players, undefined, undefined, 'roblox-cli-test-finished', waitSeconds, instanceId)
+      : await this.tools.soloPlaytest('stop', undefined, waitSeconds, instanceId));
+  }
+
+  /** StudioTestService:EndTest issued inside the play server's own DataModel. */
+  private async endTestOnServer(instanceId: string): Promise<unknown> {
+    const server = this.bridge.getPeersInScope(instanceId).find(peer => peer.role === 'server');
+    if (server === undefined) return { success: true, note: 'no play server is connected' };
+    return this.bridge.sendRequest('/api/multiplayer-test-end', { value: 'roblox-cli-teardown' }, server.peerId, SERVER_END_TEST_TIMEOUT_MS);
+  }
+
+  /**
+   * Teardown for a job whose run threw after reaching its runtime, so its own
+   * teardown never ran: release held input, then stop the job's original
+   * runtime and verify it is gone. A runtime that is not the job's own is
+   * reported and left alone, as is one the request asked to keep open.
+   */
+  private async recoverRuntime(body: JsonObject, runtime: string[]): Promise<JsonObject> {
+    const session = this.sessions.require({});
+    const expired: JsonObject[] = [];
+    const bounded: Bounded = (label, ms, work) => withDeadline(label, ms, work, (step, deadline) => { expired.push({ step, deadline_ms: deadline }); });
+    const scenario = body.scenario as Scenario | undefined;
+    const inputRelease = scenario === undefined ? undefined
+      : await bounded('input_release', 45_000, this.releaseScenarioInput(scenario)) ?? { released: false, error: 'input release exceeded 45s' };
+    const present = this.runtimeIdentity();
+    const deadlines = expired.length ? { deadlines: expired } : {};
+    if (!runtime.some(peer => present.includes(peer))) return { input_release: inputRelease, runtime: 'stopped', note: 'the original runtime is already gone', ...deadlines };
+    if (body.keep_open === true) return { input_release: inputRelease, runtime: 'kept_open', ...deadlines };
+    const players = numberField(body.players, 'players', { integer: true, min: 1, max: 8 }) ?? 1;
+    const timeout = numberField(body.timeout, 'timeout', { integer: true, min: 1, max: 300 }) ?? 60;
+    const stop = await this.stopRuntime(session.instance_id, { multiplayer: players > 1, players, timeout }, bounded);
+    return { input_release: inputRelease, runtime: stop.confirmed ? 'stopped' : 'still_running', stop, ...(expired.length ? { deadlines: expired } : {}) };
   }
 
   private codeWithArgs(item: JsonObject): string {
@@ -1390,9 +1636,10 @@ return {passed=#failures==0,failures=failures}`;
     if (!running)
       throw new CliCommandError('calibration_unavailable', 'Viewport calibration requires the visible play client. Start a playtest first.');
     const identity = { ...(session.place_name === undefined ? {} : { placeName: session.place_name }) };
+    const calibration = subOperations(context, 'calibrate');
     const measured = await calibratedViewportRect(
       identity,
-      async code => asObject(asObject(await this.evaluate({ target: 'client-1', code, instance_id: session.instance_id }, context)).result),
+      async code => asObject(asObject(await this.evaluate({ target: 'client-1', code, instance_id: session.instance_id }, calibration())).result),
     );
     return {
       verified: true,
@@ -1404,6 +1651,15 @@ return {passed=#failures==0,failures=failures}`;
       window: measured.window,
       note: 'A crop is valid only while the window size and the camera viewport are unchanged.',
     };
+  }
+
+  /** The visible view's render counters; best-effort, since a missing sample only omits `render_fps`. */
+  private async sampleRender(instanceId: string, context?: ToolInvocationContext): Promise<RenderSample | undefined> {
+    try {
+      return renderSample(asObject(await this.tools.getRuntimeHealth(instanceId, undefined, false, undefined, context?.signal, false)).peers);
+    } catch {
+      return undefined;
+    }
   }
 
   private async testStatus(body: JsonObject, context?: ToolInvocationContext): Promise<unknown> {

@@ -1,8 +1,11 @@
 import AppKit
 import Foundation
 
-// A lease observes app switches for its entire lifetime. It never reasserts focus.
-let policy = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "auto"
+// The explicit `--foreground` lease. It activates Studio once, then observes
+// app switches for its lifetime and never reasserts focus. macOS 14+
+// cooperative activation may refuse a background process's request while the
+// owner is using another app; that is reported as `refused` so the caller
+// fails before the playtest starts instead of running at the background rate.
 let workspace = NSWorkspace.shared
 let previous = workspace.frontmostApplication
 let studios = workspace.runningApplications.filter { $0.bundleIdentifier == "com.Roblox.RobloxStudio" }
@@ -11,10 +14,7 @@ func emit(_ object: [String: Any]) {
     FileHandle.standardOutput.write(data); FileHandle.standardOutput.write(Data([10]))
 }
 guard studios.count == 1, let studio = studios.first else {
-    emit(["error": "Exactly one Studio process is required for an input focus session"]); exit(1)
-}
-if policy == "never" && previous?.processIdentifier != studio.processIdentifier {
-    emit(["error": "Studio is not foreground; --foreground never forbids activation", "code": "foreground_required"]); exit(1)
+    emit(["error": "Exactly one Studio process is required for a foreground session"]); exit(1)
 }
 var ownerSwitched = false
 var activated = false
@@ -24,14 +24,14 @@ let token = workspace.notificationCenter.addObserver(forName: NSWorkspace.didAct
 }
 if previous?.processIdentifier != studio.processIdentifier {
     activated = studio.activate(options: [])
-    if !activated { emit(["error": "Studio could not be activated"]); exit(1) }
+    if !activated { emit(["error": "Studio activation was refused", "refused": true]); exit(1) }
 }
 let deadline = Date().addingTimeInterval(2)
 while workspace.frontmostApplication?.processIdentifier != studio.processIdentifier && Date() < deadline {
     RunLoop.main.run(until: Date().addingTimeInterval(0.02))
 }
 if workspace.frontmostApplication?.processIdentifier != studio.processIdentifier {
-    emit(["error": "Studio did not become foreground; no input session was acquired"]); exit(1)
+    emit(["error": "Studio did not become the frontmost app", "refused": true]); exit(1)
 }
 emit(["acquired": true, "activated": activated, "studio_pid": studio.processIdentifier, "previous_pid": previous?.processIdentifier ?? 0])
 DispatchQueue.global().async {

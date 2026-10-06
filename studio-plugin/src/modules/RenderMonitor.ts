@@ -1,13 +1,14 @@
-// Detects whether the Studio window is actually rendering, so virtual input
-// and screenshot tools can surface a clear reason instead of silently failing.
+// Detects whether the Studio window is actually rendering, and how fast, so
+// capture tools can surface a clear reason instead of silently failing and
+// receipts can report the real frame rate of a run.
 //
-// When a Studio window is MINIMIZED, the engine suspends the render loop AND
-// input processing, but keeps running scripts (Heartbeat keeps firing). That's
-// why simulate_*_input would return success while having zero effect, and
-// CaptureService:CaptureScreenshot would time out. Validated live: during a 3s
+// When a Studio window is MINIMIZED, or the display sleeps, the engine stops
+// its render loop but keeps running scripts (Heartbeat keeps firing), and
+// CaptureService:CaptureScreenshot times out. Validated live: during a 3s
 // minimize, RenderStepped's max inter-frame gap was 5.08s while Heartbeat's was
 // 0.10s. So RenderStepped freshness is the reliable "is this window rendering?"
-// signal; Heartbeat is not.
+// signal; Heartbeat is not. A window behind another app keeps rendering, but
+// Studio throttles it to about 15 fps; frameCount over time measures that.
 
 import { RunService } from "@rbxts/services";
 
@@ -17,9 +18,9 @@ let connected = false;
 const frameTimes: number[] = [];
 
 // Above this many seconds since the last rendered frame, we treat the window
-// as not rendering. RenderStepped normally fires every ~16ms; a multi-second
-// gap only happens when minimized/suspended, so 1s cleanly avoids false
-// positives from ordinary frame hitches while still catching the real case.
+// as not rendering. RenderStepped fires every ~16ms in front and ~66ms behind
+// another app; a multi-second gap only happens when minimized or the display
+// sleeps, so 1s avoids false positives from frame hitches.
 const STALE_THRESHOLD = 1.0;
 
 export function start(): void {
@@ -72,6 +73,9 @@ export function snapshot(): Record<string, unknown> {
 		secondsSinceFrame: gap,
 		lastFrameAt: lastFrame,
 		frameCount,
+		// The clock frameCount was read at: two samples give the frame rate
+		// over a whole run without trusting the caller's round-trip timing.
+		sampledAt: tick(),
 		frameTimeMs: count > 0 ? {
 			samples: count,
 			p50: sorted[math.ceil(count * 0.5) - 1],
@@ -97,18 +101,18 @@ export function waitForRenderedFrame(timeoutSeconds = 2): boolean {
 	return frameCount > initialFrameCount;
 }
 
-// Returns a human-readable reason if the window appears minimized / not
-// rendering (so input + screenshots won't work), else undefined. Fail-open:
-// when the monitor isn't active in this DM (server peer, or connect failed) it
-// returns undefined so we never block on a false signal.
+// Returns a human-readable reason if the window has stopped rendering, else
+// undefined. Fail-open: when the monitor isn't active in this DM (server peer,
+// or connect failed) it returns undefined so we never block on a false signal.
+// A background window still renders (Studio throttles it to ~15 fps); a stale
+// render loop means the window is minimized or the display is asleep.
 export function notRenderingReason(): string | undefined {
 	if (!connected) return undefined;
 	const gap = secondsSinceFrame();
 	if (gap > STALE_THRESHOLD) {
 		return string.format(
-			"Studio window appears minimized or not rendering (no frame in %.1fs). " +
-				"Virtual input and screenshots only work while the window is visible — " +
-				"restore/un-minimize the Studio window and retry.",
+			"Studio is not rendering (no frame in %.1fs): its window is minimized or the display is asleep. " +
+				"Restore the window or wake the display, then retry.",
 			gap,
 		);
 	}

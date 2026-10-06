@@ -18,19 +18,21 @@ const PROBE_GRID = 4;
 // Studio view directly. Keep the local shape here so this package remains
 // buildable with older @rbxts type definitions; the runtime capability is
 // discovered with pcall below and the existing CaptureService path remains the
-// compatibility fallback.
+// compatibility fallback. Members are declared with method syntax so roblox-ts
+// emits `:` calls; a property-typed function compiles to a `.` call, which
+// Luau rejects for these engine methods ("Expected ':' not '.'").
 type StudioScreenshotCaptureLike = {
 	BufferFormat: unknown;
 	BufferStatus: unknown;
 	Resolution: Vector2;
-	GetBuffer: () => buffer;
-	GetErrors: () => defined[];
+	GetBuffer(): buffer;
+	GetErrors(): defined[];
 };
 
 type StudioCaptureServiceLike = {
-	CanCaptureScreenshot: () => boolean;
-	CaptureScreenshot: (options: Record<string, unknown>) => StudioScreenshotCaptureLike;
-	RequestScreenshotPermissionAsync: () => boolean;
+	CanCaptureScreenshot(): boolean;
+	CaptureScreenshot(options: Record<string, unknown>): StudioScreenshotCaptureLike;
+	RequestScreenshotPermissionAsync(): boolean;
 };
 
 const B64: number[] = [];
@@ -97,7 +99,7 @@ function captureStudioScreenshotData(): unknown {
 	}
 
 	const [serviceOk, serviceResult] = pcall(() => {
-		const gameWithUnknownServices = game as unknown as { GetService: (name: string) => Instance };
+		const gameWithUnknownServices = game as unknown as { GetService(name: string): Instance };
 		return gameWithUnknownServices.GetService("StudioCaptureService") as unknown as StudioCaptureServiceLike;
 	});
 	if (!serviceOk) {
@@ -247,7 +249,7 @@ function doCaptureScreenshot(timeoutSeconds = 10): { contentId: string } | { err
 	while (contentId === undefined) {
 		if (tick() - startTime > timeoutSeconds) {
 			return {
-				error: "Screenshot capture timed out (CaptureScreenshot callback never fired). The Studio window is likely minimized or occluded — restore it so the viewport renders. (Known Roblox bug: capture can also fail if the viewport renders a solid color.)",
+				error: "Screenshot capture timed out (CaptureScreenshot callback never fired). The Studio window is likely minimized or the display is asleep — restore the window or wake the display so the viewport renders. (Known Roblox bug: capture can also fail if the viewport renders a solid color.)",
 			};
 		}
 		task.wait(0.1);

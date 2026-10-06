@@ -63,7 +63,7 @@ function substitute(value: unknown, args: Json): unknown {
 }
 const fields: Record<string, string[]> = {
   wait: ['duration_ms', 'duration'],
-  eval: ['code', 'args', 'interactive'],
+  eval: ['code', 'args'],
   wait_until: ['code', 'args', 'timeout_ms', 'interval_ms', 'stable_samples', 'stable_frames'],
   logs: ['scope', 'tail', 'filter', 'cursor'],
   screenshot: ['format', 'quality', 'backend', 'focus', 'crop'],
@@ -122,6 +122,8 @@ export function compileScenario(raw: unknown): Scenario {
       const type = String(step.type);
       if (!Object.hasOwn(fields, type))
         fail(`${name}: unsupported step type ${type}`);
+      if (type === 'eval' && step.interactive !== undefined)
+        fail(`${name}: "interactive" was removed; scenario input runs with Studio in the background, so delete the field`);
       keys(step, ['type', 'name', 'target', 'expect', ...fields[type]], name);
       if (step.target !== undefined && (typeof step.target !== 'string' || !/^(edit|server|client-[1-9]\d*)$/.test(step.target)))
         fail(`${name}: invalid target`);
@@ -131,12 +133,8 @@ export function compileScenario(raw: unknown): Scenario {
         condition(step.expect, `${name}.expect`);
       if (step.args !== undefined && !object(step.args))
         fail(`${name}.args must be an object`);
-      if (type === 'eval' || type === 'wait_until') {
-        if (typeof step.code !== 'string' || !step.code.trim())
-          fail(`${name}: code is required`);
-        if (step.interactive !== undefined && typeof step.interactive !== 'boolean')
-          fail(`${name}: interactive must be boolean`);
-      }
+      if ((type === 'eval' || type === 'wait_until') && (typeof step.code !== 'string' || !step.code.trim()))
+        fail(`${name}: code is required`);
       if (['click_gui', 'interact_prompt'].includes(type))
         path(step.path, `${name}.path`);
       if (type === 'interact_prompt' && step.gui_path !== undefined)
@@ -246,9 +244,4 @@ export function validateDiagnostics(body: Json) {
     for (const p of body.blockers)
       path(p, 'blocker');
   }
-}
-export function scenarioNeedsInput(scenario?: {
-  steps: Json[];
-}): boolean {
-  return !!scenario?.steps.some(s => ['keyboard', 'mouse', 'click_gui', 'click_world', 'interact_prompt'].includes(String(s.type)) || (s.type === 'eval' && s.interactive === true));
 }

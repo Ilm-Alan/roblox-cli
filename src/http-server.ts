@@ -827,6 +827,9 @@ export function createHttpServer(tools: RobloxStudioTools, bridge: BridgeService
   const sendRequestStatus = (res: Response, requestId: string) => {
     res.setHeader(AGENT_PROTOCOL_HEADER, String(AGENT_PROTOCOL_VERSION));
     res.setHeader(REQUEST_ID_HEADER, requestId);
+    // Reading an attended job's status is what following it means: each read
+    // renews the lease that otherwise cancels the job (test-jobs.ts).
+    cliCommands.service.jobs.observe(requestId);
     const status = cliCommands.service.jobs.status(requestId) ?? workflowStatus(requestId)
       ?? cliCommands.service.requestStatus(requestId);
     if (status === undefined) {
@@ -906,10 +909,14 @@ export function createHttpServer(tools: RobloxStudioTools, bridge: BridgeService
       }
       const requestId = typeof suppliedRequestId === 'string' ? suppliedRequestId : randomBytes(16).toString('hex');
       res.setHeader(REQUEST_ID_HEADER, requestId);
-      if (toolName === 'test' && req.body?.action === 'play' && req.body.background !== false) {
+      // A playtest always runs as a durable job: it owns its session, survives
+      // this connection, and is cancelled with full teardown when an attended
+      // job's follower stops reading its status. There is no synchronous form
+      // whose connection drop would abandon a running playtest.
+      if (toolName === 'test' && req.body?.action === 'play') {
         try {
           const job = cliCommands.service.submitTest(req.body, requestId);
-          res.status(202).json({ accepted: true, ...job as Record<string, unknown>, next: `roblox status --request-id ${requestId}` });
+          res.status(202).json({ accepted: true, ...job as Record<string, unknown>, next: `roblox test job --job ${requestId} --follow` });
         } catch (error) { res.status(commandErrorStatus(error)).json(publicToolErrorBody(toolName, error)); }
         return;
       }

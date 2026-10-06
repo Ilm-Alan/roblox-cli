@@ -8,6 +8,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { dataDirectory } from './paths.js';
 import { packageRoot } from './daemon-control.js';
 import { acquireFocus } from './focus-session.js';
+import { renderReceipt, type RenderSample } from './render-rate.js';
 import { resolveStudioWindow } from './native-screen-capture.js';
 
 /** The 600 s ceiling belongs to `roblox record --duration`, not to the
@@ -381,19 +382,28 @@ export async function stopNativeRecording(file?: string): Promise<Record<string,
 
 /**
  * The documented `roblox record --duration SECONDS --output FILE.mp4` contract.
- * It keeps its own input focus lease, because a caller outside a scenario has
- * no other process keeping the display awake for it.
+ * Studio stays in the background unless `foreground` is set: the recorder
+ * keeps the display awake itself, and the opt-in lease exists only for a
+ * full-rate capture (Studio throttles its rendering when it is not frontmost).
+ * `sampleRender` reads the plugin's render counters around the capture so the
+ * receipt carries the rate Studio actually rendered at.
  */
-export async function recordNativeStudio(seconds: number, output: string, foreground = 'auto'): Promise<Record<string, unknown>> {
+export async function recordNativeStudio(seconds: number, output: string, options: {
+  foreground?: boolean;
+  sampleRender?: () => Promise<RenderSample | undefined>;
+} = {}): Promise<Record<string, unknown>> {
   if (!Number.isFinite(seconds) || seconds <= 0 || seconds > MAX_FIXED_RECORDING_SECONDS)
     throw new Error(`Recording duration must be between 0 and ${MAX_FIXED_RECORDING_SECONDS} seconds.`);
   const file = resolve(output);
   mkdirSync(dirname(file), { recursive: true });
-  const focus = await acquireFocus(foreground, true);
+  const foreground = options.foreground === true;
+  const focus = await acquireFocus(foreground);
   try {
+    const renderStart = await options.sampleRender?.();
     const started = await startNativeRecording({ file, seconds });
     const receipt = await awaitFinalization(String(started.state_file), file, Number(started.pid), (seconds + 60) * 1000);
-    return { ...receipt, focus: focus.receipt };
+    const render = renderReceipt(renderStart, await options.sampleRender?.(), foreground);
+    return { ...receipt, ...(render ?? {}), focus: focus.receipt };
   }
   finally {
     await focus.release();

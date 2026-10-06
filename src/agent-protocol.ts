@@ -26,8 +26,8 @@ export const CLI_TEST_MODES = ['run', 'play', 'status', 'stop', 'validate', 'job
 /** Error codes that exit 2: the caller must fix its request. */
 export const USAGE_ERROR_CODES = [
   'usage_error', 'invalid_argument', 'invalid_scenario', 'invalid_json', 'invalid_request_id',
-  'invalid_capture_backend', 'invalid_crop', 'invalid_foreground_policy', 'test_mode_required',
-  'request_too_large', 'artifact_failed', 'unknown_agent_route', 'multiple_sessions',
+  'invalid_capture_backend', 'invalid_crop', 'test_mode_required',
+  'request_too_large', 'artifact_failed', 'output_exists', 'unknown_agent_route', 'multiple_sessions',
 ] as const;
 
 /** Error codes that exit 3: something the command needs was unavailable before execution. */
@@ -259,7 +259,6 @@ const COMMAND_SPECS: Record<(typeof AGENT_COMMAND_NAMES)[number], JsonObject> = 
                   code: { type: 'string' },
                   name: { type: 'string' },
                   args: { type: 'object' },
-                  interactive: { type: 'boolean' },
                   expect: { type: 'object', description: 'Read-only Luau condition with target, timeout_ms, interval_ms, stable_samples.' },
                   position: { type: 'array', items: { type: 'number' }, minItems: 3, maxItems: 3 },
                   gui_path: { type: 'array', items: { type: 'string' } },
@@ -284,11 +283,12 @@ const COMMAND_SPECS: Record<(typeof AGENT_COMMAND_NAMES)[number], JsonObject> = 
         readiness_attribute: { type: 'string' },
         timeout_ms: { ...EXECUTION_TIMEOUT_MS, description: `run: ${EXECUTION_TIMEOUT_MS.description}` },
         timeout: { type: 'integer', minimum: 1, maximum: 300, default: 60, description: 'play: seconds allowed for playtest start, stop and the readiness wait.' },
-        record: { type: 'string', description: 'Absolute path for one continuous MP4 of the play client viewport, started with the playtest and stopped when the scenario ends. Pair with --scenario. Calibration failure falls back to a full-window recording and is reported explicitly; a timeline.json sidecar is written next to the video.' },
+        record: { type: 'string', description: 'Absolute path for one continuous MP4 of the play client viewport, started with the playtest and stopped when the scenario ends. Pair with --scenario. An existing file is refused with output_exists before any job starts unless overwrite is true. Calibration failure falls back to a full-window recording and is reported explicitly; a timeline.json sidecar is written next to the video.' },
+        overwrite: { type: 'boolean', default: false, description: 'play with record: replace an existing record file. The new video is moved into place in one rename only after it finalized and the run passed; otherwise the old file survives and the new video stays beside it.' },
         keep_open: { type: 'boolean' },
         test_args: { type: 'object' },
-        background: { type: 'boolean', default: true, description: 'play admits a durable job with HTTP 202; false selects the legacy synchronous API.' },
-        foreground: { type: 'string', enum: ['auto', 'never', 'required'], default: 'auto' },
+        detach: { type: 'boolean', default: false, description: 'play/resume: run unattended. An attended job (the default) is cancelled, with full teardown, when nobody has read its status (GET /v2/requests/:id) for 30 s.' },
+        foreground: { type: 'boolean', default: false, description: 'Opt in to bringing Studio to the front for a full-frame-rate capture. Studio otherwise stays in the background, where input, screenshots and recording all work but Studio renders at about 15 fps. Fails before play with foreground_unavailable when macOS refuses the activation.' },
         job_id: { type: 'string' },
         checks: { type: 'array', items: { type: 'string', enum: ['ui', 'prompts', 'performance', 'readiness', 'counts'] } },
         blockers: { type: 'array', items: { type: 'array', items: { type: 'string' } } },
@@ -298,21 +298,39 @@ const COMMAND_SPECS: Record<(typeof AGENT_COMMAND_NAMES)[number], JsonObject> = 
     },
     forms: {
       run: 'roblox test run CODE [--timeout SECONDS]',
-      play: 'roblox test play --duration SEC | --scenario FILE [--record FILE.mp4] | --keep-open [--ready-timeout SECONDS]',
+      play: 'roblox test play --duration SEC | --scenario FILE [--record FILE.mp4 [--overwrite]] [--foreground] | --keep-open [--ready-timeout SECONDS] [--detach]',
       status: 'roblox test status',
       stop: 'roblox test stop',
       validate: 'roblox test validate --scenario FILE',
       job: 'roblox test job --job ID [--follow]',
-      cancel: 'roblox test cancel --job ID',
+      cancel: 'roblox test cancel --job ID — interrupts waits at once, lets an in-flight action answer, then stops the recorder and the playtest; returns once the job settles (bounded at 30 s).',
       resume: 'roblox test resume --job ID [--detach]',
       diagnose: 'roblox test diagnose --checks ui,prompts,performance --duration 10',
       calibrate: 'roblox test calibrate',
     },
     response: {
       type: 'object',
-      description: 'play returns HTTP 202 with job_id, state and progress; GET /v2/requests/:id reconnects. result returns the durable complete receipt. Gameplay passed and capture_passed are independent.',
+      description: 'play returns HTTP 202 with job_id, state and progress; GET /v2/requests/:id reconnects and renews an attended job\'s lease. result returns the durable complete receipt: passed is the overall verdict, outcome is what the scenario did, cleanup is how teardown went. Gameplay passed and capture_passed are independent.',
       properties: {
-        passed: { type: 'boolean' },
+        passed: { type: 'boolean', description: 'play: outcome.passed, not suspicious, and cleanup.passed.' },
+        outcome: {
+          type: 'object',
+          description: 'play: the scenario verdict (startup, readiness, recording start, every step, duration), independent of teardown.',
+          properties: { passed: { type: 'boolean' }, steps_passed: { type: 'integer' }, steps_total: { type: 'integer' }, error: { type: 'object' } },
+        },
+        cleanup: {
+          type: 'object',
+          description: 'play: teardown. runtime is stopped only when the bridge peer list shows the server and clients gone; a stop request that failed while the runtime still went away is a warning, a runtime left running is a failure.',
+          properties: {
+            passed: { type: 'boolean' },
+            runtime: { type: 'string', enum: ['stopped', 'kept_open', 'still_running', 'unverified'] },
+            stop: { type: 'object', properties: { confirmed: { type: 'boolean' }, attempts: { type: 'array' }, remaining: { type: 'array', items: { type: 'string' } } } },
+            input_release: { type: 'object' },
+            warnings: { type: 'array', items: { type: 'string' } },
+            failures: { type: 'array', items: { type: 'string' } },
+            deadlines: { type: 'array' },
+          },
+        },
         capture_passed: { type: 'boolean' },
         capture_requested: { type: 'boolean' },
         job_id: { type: 'string' },
@@ -324,6 +342,8 @@ const COMMAND_SPECS: Record<(typeof AGENT_COMMAND_NAMES)[number], JsonObject> = 
         result: {},
         failure: { type: 'object' },
         suspicious: { type: 'boolean' },
+        render_fps: { type: 'number', description: 'play: frames per second the visible Studio view (client-1, else edit) actually rendered during the run, measured by the plugin. Also on the recording receipt.' },
+        warnings: { type: 'array', items: { type: 'string' }, description: 'play: scenario warnings, plus a warning when render_fps is below 25 (Studio throttles a window that is not frontmost; pass --foreground for a full-rate video).' },
         evidence_directory: { type: 'string' },
         runtime_health: { type: 'object' },
         solo_outcome: {
@@ -346,7 +366,7 @@ const COMMAND_SPECS: Record<(typeof AGENT_COMMAND_NAMES)[number], JsonObject> = 
         },
       },
     },
-    errors: ['test_mode_required', 'playtest_failed', 'assertion_failed', 'session_required', 'session_disconnected'],
+    errors: ['test_mode_required', 'playtest_failed', 'playtest_suspicious', 'cleanup_failed', 'assertion_failed', 'output_exists', 'job_conflict', 'session_required', 'session_disconnected'],
   },
 };
 
@@ -566,7 +586,7 @@ export function agentSchema(allowedCommands?: Iterable<string>): JsonObject {
     },
     commands,
     local_commands: {
-      record: { form: "roblox record --duration SECONDS --output FILE.mp4", description: "macOS 15+: continuous Studio window video and application audio; microphone excluded. Existing files are never overwritten. The fixed form is capped at 600 seconds." },
+      record: { form: "roblox record --duration SECONDS --output FILE.mp4 [--foreground]", description: "macOS 15+: continuous Studio window video and application audio; microphone excluded. Existing files are never overwritten. The fixed form is capped at 600 seconds. Studio stays in the background unless --foreground; the receipt reports render_fps when the daemon can measure it." },
       record_studio: { form: "roblox record-studio start --out FILE.mp4 [--duration SECONDS] | roblox record-studio stop", description: "Uncapped start/stop recording of one Studio window bound by window identity. The CLI signals the running helper; --duration is only an optional safety cap. Calibrate the play viewport first with roblox screenshot --target client-1 --crop viewport." },
       close: 'roblox close — detach from the session, or close a Studio process owned by roblox open.',
       status: 'roblox status [--capture-probe] | roblox status --request-id ID — return a compact connected-instance and active-session summary (--capture-probe also samples rendered frames), or recover the outcome of one request.',

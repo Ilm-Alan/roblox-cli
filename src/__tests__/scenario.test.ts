@@ -1,4 +1,4 @@
-import { compileScenario, scenarioNeedsInput } from '../scenario.js';
+import { compileScenario } from '../scenario.js';
 import { selectStudioWindow } from '../native-screen-capture.js';
 describe('scenario preflight', () => {
   test('rejects a late invalid action before any part of the scenario can execute', () => {
@@ -10,7 +10,6 @@ describe('scenario preflight', () => {
   test('expands reusable named actions with typed data parameters and no code interpolation', () => {
     const result = compileScenario({ actions: { inspect: { parameters: ['target'], steps: [{ name: 'click', type: 'click_gui', path: { $param: 'target' } }] } }, steps: [{ type: 'use', name: 'sell', action: 'inspect', args: { target: ['Trade', 'Ship'] } }] });
     expect(result.steps).toEqual([{ type: 'click_gui', name: 'sell/click', path: ['Trade', 'Ship'] }]);
-    expect(scenarioNeedsInput(result)).toBe(true);
     expect(() => compileScenario({ actions: { recur: { parameters: [], steps: [{ type: 'use', action: 'recur' }] } }, steps: [{ type: 'use', action: 'recur' }] })).toThrow(/recursive/);
   });
   test('normalizes duration units and truthfully names condition samples', () => {
@@ -18,8 +17,10 @@ describe('scenario preflight', () => {
     expect(result.steps.map(s => s.duration_ms)).toEqual([80, 80, undefined]);
     expect(result.steps[2]).toMatchObject({ stable_samples: 2, interval_ms: 200 });
     expect(result.warnings).toHaveLength(2);
-    expect(scenarioNeedsInput(compileScenario({ steps: [{ type: 'eval', code: 'return true' }] }))).toBe(false);
-    expect(scenarioNeedsInput(compileScenario({ steps: [{ type: 'eval', code: 'sendInput()', interactive: true }] }))).toBe(true);
+  });
+  test('rejects the removed eval "interactive" flag with a reason', () => {
+    expect(() => compileScenario({ steps: [{ type: 'eval', code: 'sendInput()', interactive: true }] })).toThrow(/"interactive" was removed/);
+    expect(compileScenario({ steps: [{ type: 'eval', code: 'return true' }] }).steps).toHaveLength(1);
   });
   test('capture selects the requested Studio window instead of whichever window is first', () => {
     const windows = [{ id: 1, pid: 10, title: 'Other.rbxl', bounds: {} }, { id: 2, pid: 20, title: 'Sample.rbxl - Studio', bounds: {} }];
