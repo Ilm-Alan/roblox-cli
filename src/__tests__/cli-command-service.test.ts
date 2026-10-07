@@ -15,6 +15,7 @@ import * as recording from '../native-recording.js';
 import * as worker from '../capture-worker.js';
 import { acquireFocus } from '../focus-session.js';
 import { tmpdir } from 'node:os';
+import { setImmediate as nextTurn } from 'node:timers/promises';
 import { BridgeService, RequestFailure } from '../bridge-service.js';
 import { CliCommandService } from '../cli-command-service.js';
 import { publicRequestStatus, publicToolErrorBody } from '../command-results.js';
@@ -1412,12 +1413,16 @@ describe('wait_until honours its deadline and says why it failed', () => {
     jest.useFakeTimers();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     jest.useRealTimers();
     jest.restoreAllMocks();
     if (previousHome === undefined) delete process.env.ROBLOX_CLI_HOME;
     else process.env.ROBLOX_CLI_HOME = previousHome;
-    rmSync(testHome, { recursive: true, force: true });
+    // The fixture's registry writes on real I/O while these tests run on fake
+    // timers, so a write can still be landing here: let it, then remove with
+    // Node's own retry for a directory that is still filling.
+    await nextTurn();
+    rmSync(testHome, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
   });
 
   const clientHealth = (render: Record<string, unknown>) => ({ peers: { 'client-1': { role: 'client-1', render: { available: true, frame_count: 575, sampled_at: 100, ...render } } } });
