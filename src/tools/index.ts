@@ -552,11 +552,11 @@ export class RobloxStudioTools {
     };
   }
 
-  async executeLuau(code: string, target?: string, instance_id?: string, operation_id?: string, timeoutMs?: number) {
+  async executeLuau(code: string, target?: string, instance_id?: string, operation_id?: string, timeoutMs?: number, signal?: AbortSignal) {
     if (!code) {
       throw new Error('Code is required for execute_luau');
     }
-    const response = await this._callSingle('/api/execute-luau', { code }, target || 'edit', instance_id, timeoutMs, undefined, operation_id);
+    const response = await this._callSingle('/api/execute-luau', { code }, target || 'edit', instance_id, timeoutMs, signal, operation_id);
     return {
       content: [
         {
@@ -567,11 +567,11 @@ export class RobloxStudioTools {
     };
   }
 
-  async evalServerRuntime(code: string, instance_id?: string, operation_id?: string, timeoutMs?: number) {
+  async evalServerRuntime(code: string, instance_id?: string, operation_id?: string, timeoutMs?: number, signal?: AbortSignal) {
     if (!code) {
       throw new Error('Code is required for eval_server_runtime');
     }
-    const response = await this._callSingle('/api/eval-runtime', { code }, 'server', instance_id, timeoutMs, undefined, operation_id);
+    const response = await this._callSingle('/api/eval-runtime', { code }, 'server', instance_id, timeoutMs, signal, operation_id);
     return {
       content: [
         {
@@ -582,7 +582,7 @@ export class RobloxStudioTools {
     };
   }
 
-  async evalClientRuntime(code: string, target?: string, instance_id?: string, operation_id?: string, timeoutMs?: number) {
+  async evalClientRuntime(code: string, target?: string, instance_id?: string, operation_id?: string, timeoutMs?: number, signal?: AbortSignal) {
     if (!code) {
       throw new Error('Code is required for eval_client_runtime');
     }
@@ -590,7 +590,7 @@ export class RobloxStudioTools {
     if (!clientTarget.startsWith('client-')) {
       throw new Error(`eval_client_runtime requires target=client-N (got: ${clientTarget})`);
     }
-    const response = await this._callSingle('/api/eval-runtime', { code }, clientTarget, instance_id, timeoutMs, undefined, operation_id);
+    const response = await this._callSingle('/api/eval-runtime', { code }, clientTarget, instance_id, timeoutMs, signal, operation_id);
     return {
       content: [
         {

@@ -39,6 +39,26 @@ consecutive observations:
 }
 ```
 
+`timeout_ms` is a wall-clock deadline, honoured with a small bounded overshoot
+by every condition wait (`wait_until` steps, a step's `expect`, and the play
+readiness wait). Each poll is raced against the time left, with a 250 ms floor
+so a poll started just before the deadline can still answer. A poll still
+unanswered at the deadline is abandoned: its bridge waiter ends and Studio is
+told to drop it, so nothing stays queued for later steps. A failed wait's
+receipt has `timed_out`, `last_evaluation_abandoned`, and a `code` saying why:
+
+- `host_slept`: the Mac slept during the wait (closing the lid sleeps it even
+  while a recording or `caffeinate` keeps the display awake), so the deadline
+  passed while nothing ran. `host_slept_ms` is a lower bound on the sleep, and
+  the wait ends within a second of waking.
+- `render_stalled`: the visible view (client-1, else edit) had stopped
+  rendering, read from one runtime-health sample taken when the wait failed;
+  `render` gives its `seconds_since_frame`.
+- `timeout`: neither; the condition never held.
+
+`warnings` on the receipt states the first two in plain words, and a play run
+stopped by such a wait reports it as `failure.reason`.
+
 ## Install from this developer package
 
 Requirements: macOS, Node.js 22+, Roblox Studio, and Apple's Command Line Tools
@@ -262,7 +282,13 @@ and screenshots and recording capture the Studio window, so a playtest never
 needs Studio in front and never takes the desktop from you: no focus helper
 runs, and nothing wakes the display except a recording. A window that is
 minimized, or a sleeping display, stops Studio rendering; screenshots then fail
-with that reason.
+with that reason. The play receipt then warns `Studio is not rendering (display
+asleep or window minimized); steps that wait on rendering will stall.` whenever
+the run's render samples show it, at the end of the run or as `render_fps`
+under 1. A stalled view fails a run only through a step that depended on it: a
+wait that timed out (`render_stalled`), a failed screenshot, or, at teardown,
+a run with a recording or screenshot step (`playtest_suspicious`). A run of
+evaluations that all passed still passes, with the warning.
 
 Behind another app Studio throttles its own rendering to about 15 fps. Steps
 and screenshots are unaffected, but a video has about that many distinct frames.
@@ -364,7 +390,9 @@ a stop RPC answered. A stop RPC that timed out while the runtime still went
 away is a warning; a runtime left running, held input in a live runtime, or a
 requested video that never finalized is a failure. Top-level `passed` is
 `outcome.passed`, not `suspicious`, and `cleanup.passed`; `failure.code` is
-`playtest_failed`, `playtest_suspicious` or `cleanup_failed` accordingly.
+`playtest_failed`, `playtest_suspicious` or `cleanup_failed` accordingly. A
+`playtest_failed` run stopped by a timed-out wait whose cause is known adds
+`failure.reason`: `render_stalled` or `host_slept`.
 
 Local validation expands all reusable actions and rejects invalid fields,
 units, names and structures before admission. Luau behavior, target availability

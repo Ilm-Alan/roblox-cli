@@ -15,7 +15,7 @@ import { captureFrame } from './capture-pipeline.js';
 import { recordingStatus } from './native-recording.js';
 import { startScenarioRecording, writeTimeline, type ScenarioRecordingSession, type TimelineEntry } from './scenario-recording.js';
 import { calibratedViewportRect } from './viewport-capture.js';
-import { renderReceipt, renderSample, type RenderReceipt, type RenderSample } from './render-rate.js';
+import { RENDER_STALLED_WARNING, renderReceipt, renderSample, type RenderReceipt, type RenderSample } from './render-rate.js';
 import type { RobloxStudioTools } from './tools/index.js';
 
 type JsonObject = Record<string, unknown>;
@@ -255,7 +255,13 @@ function placeRecording(target: RecordingTarget, runPassed: boolean): { file: st
   }
 }
 
-function isSuspiciousRuntimeHealth(value: unknown): boolean {
+/**
+ * Whether teardown health makes a passing run untrustworthy. A view that has
+ * stopped rendering only counts when the run's evidence depends on rendering
+ * (a recording or a screenshot step); otherwise it is a warning, not a
+ * failure, because the run's own evaluations proved what they checked.
+ */
+function isSuspiciousRuntimeHealth(value: unknown, renderMatters: boolean): boolean {
   const body = asObject(value);
   const health = body.runtime_health ?? body.runtimeHealth;
   if (!health || typeof health !== 'object' || Array.isArray(health)) return false;
@@ -266,13 +272,44 @@ function isSuspiciousRuntimeHealth(value: unknown): boolean {
     const render = asObject(peer.render);
     const runtimePeer = peer.role !== 'server' && peer.role !== 'edit';
     if (runtimePeer && render.available === false) return true;
-    if (runtimePeer && (render.rendering === false || render.state === 'stale')) return true;
-
+    if (renderMatters && runtimePeer && (render.rendering === false || render.state === 'stale')) return true;
   }
   return false;
 }
 
 const WAIT_UNTIL_POLL_MS = 50;
+/** A poll's own bridge deadline: `evaluate`'s default timeout. */
+const WAIT_UNTIL_EVALUATION_TIMEOUT_MS = 30_000;
+/** The least a poll gets to answer, even one started just before the deadline. */
+const WAIT_UNTIL_MIN_EVALUATION_MS = 250;
+/** An await that overran its own timers by more than this means the process was suspended. */
+const HOST_SLEEP_SLACK_MS = 5_000;
+
+/**
+ * A signal that aborts at a wall-clock time. It re-reads the clock at least
+ * once a second: timers do not run while macOS sleeps, so a deadline that
+ * passed during sleep still fires within a second of waking.
+ */
+function wallClockDeadline(at: number): { signal: AbortSignal; dispose(): void } {
+  const controller = new AbortController();
+  let timer: NodeJS.Timeout | undefined;
+  const check = () => {
+    const remaining = at - Date.now();
+    if (remaining <= 0) controller.abort(new Error('deadline passed'));
+    else timer = setTimeout(check, Math.min(remaining, 1_000));
+  };
+  check();
+  return { signal: controller.signal, dispose: () => clearTimeout(timer) };
+}
+
+/** Rejects when `signal` aborts, so a race can stop waiting on work that ignores it. */
+function abandoned(signal: AbortSignal): Promise<never> {
+  const { promise, reject } = Promise.withResolvers<never>();
+  if (signal.aborted) reject(signal.reason);
+  else signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+  return promise;
+}
+
 // The bridge retains at most 1024 operation results; a recovered eval without
 // a retained result has no payload to shape, so older targets are not needed.
 const EVALUATION_TARGET_LIMIT = 1024;
@@ -781,7 +818,12 @@ export class CliCommandService {
     };
   }
 
-  async evaluate(body: JsonObject, context?: ToolInvocationContext): Promise<unknown> {
+  /**
+   * `abandon` ends the bridge waiter early (a poll whose deadline passed, or a
+   * cancelled job). The plain `eval` command never passes it: an evaluation may
+   * mutate, so its caller waits for the answer or the request timeout.
+   */
+  async evaluate(body: JsonObject, context?: ToolInvocationContext, abandon?: AbortSignal): Promise<unknown> {
     const session = this.sessions.require(body);
     const code = requiredString(body.code, 'code');
     const target = body.target === undefined ? 'edit' : requiredString(body.target, 'target');
@@ -798,10 +840,10 @@ export class CliCommandService {
     }
     const startedAt = Date.now();
     const raw = target === 'server'
-      ? await this.tools.evalServerRuntime(code, session.instance_id, context?.requestId, timeoutMs)
+      ? await this.tools.evalServerRuntime(code, session.instance_id, context?.requestId, timeoutMs, abandon)
       : target.startsWith('client-')
-        ? await this.tools.evalClientRuntime(code, target, session.instance_id, context?.requestId, timeoutMs)
-        : await this.tools.executeLuau(code, 'edit', session.instance_id, context?.requestId, timeoutMs);
+        ? await this.tools.evalClientRuntime(code, target, session.instance_id, context?.requestId, timeoutMs, abandon)
+        : await this.tools.executeLuau(code, 'edit', session.instance_id, context?.requestId, timeoutMs, abandon);
     const result = parseToolResult(raw);
     const durationMs = Date.now() - startedAt;
     const failure = evaluationError(result);
@@ -1191,7 +1233,8 @@ return {passed=#failures==0,failures=failures}`;
           instance_id: session.instance_id,
           ...(body.readiness_attribute === undefined ? {} : { readiness_attribute: body.readiness_attribute }),
         }, context);
-        if (isSuspiciousRuntimeHealth(statusBeforeTeardown)) {
+        const renderMatters = recordTarget !== undefined || scenario?.steps.some(step => step.type === 'screenshot') === true;
+        if (isSuspiciousRuntimeHealth(statusBeforeTeardown, renderMatters)) {
           suspicious = true;
           passed = false;
         }
@@ -1344,12 +1387,29 @@ return {passed=#failures==0,failures=failures}`;
 
     cleanup.passed = cleanup.failures.length === 0;
     const verdict = passed && cleanup.passed;
+    // Timed-out waits (readiness, wait_until steps and their expectations)
+    // carry their own diagnosis; the last one is the reason the run stopped.
+    const timedOut = [evidence.readiness, ...steps.flatMap(step => [step.result, step.expectation])]
+      .map(asObject).filter(wait => wait.timed_out === true);
+    const cause = timedOut.at(-1)?.code;
+    const reason = cause === 'render_stalled'
+      ? { reason: cause, message: 'Playtest QA failed: a wait timed out while Studio was not rendering (display asleep or window minimized).' }
+      : cause === 'host_slept'
+        ? { reason: cause, message: 'Playtest QA failed: the Mac slept during a wait, so its deadline passed while it was asleep.' }
+        : { message: 'Playtest QA failed.' };
     const failure = verdict ? undefined
       : fault !== undefined ? { code: String(fault.code), message: String(fault.message) }
-      : !scenarioPassed ? { code: 'playtest_failed', message: cancelled() ? 'The job was cancelled.' : 'Playtest QA failed.' }
+      : !scenarioPassed ? { code: 'playtest_failed', ...(cancelled() ? { message: 'The job was cancelled.' } : reason) }
       : suspicious ? { code: 'playtest_suspicious', message: 'Every step passed, but runtime health was suspicious at teardown.' }
       : { code: 'cleanup_failed', message: `Every step passed, but cleanup failed: ${cleanup.failures.join('; ')}` };
-    const warnings = [...(scenario?.warnings ?? []), ...(render?.warning === undefined ? [] : [render.warning])];
+    // A stalled view is reported whenever it was seen, but only fails the run
+    // through a step that actually waited on it.
+    const warnings = [...new Set([
+      ...(scenario?.warnings ?? []),
+      ...(render?.warning === undefined ? [] : [render.warning]),
+      ...(renderSample(asObject(statusBeforeTeardown).runtime_health)?.stalled ? [RENDER_STALLED_WARNING] : []),
+      ...timedOut.flatMap(wait => Array.isArray(wait.warnings) ? wait.warnings.map(String) : []),
+    ])];
     return {
       passed: verdict,
       mode: 'play',
@@ -1443,9 +1503,24 @@ return {passed=#failures==0,failures=failures}`;
     throw new CliCommandError('invalid_scenario', `Unsupported scenario step type "${type}".`);
   }
 
+  /**
+   * Poll a condition until it holds for `stable_samples` consecutive polls or
+   * `timeout_ms` passes. The deadline is wall-clock and honoured with a small
+   * bounded overshoot: each evaluation is raced against the time left (with a
+   * short floor so a last poll can answer), and a poll still unanswered at the
+   * deadline is abandoned, which ends its bridge waiter and tells Studio to
+   * drop it instead of leaving it queued for later steps.
+   *
+   * A failure says why when it can: `code` is `host_slept` when the Mac was
+   * suspended for part of the wait (timers and Studio stop while it sleeps,
+   * so the deadline passes unobserved), `render_stalled` when the visible view
+   * has stopped rendering (a sleeping display or a minimized window), and
+   * `timeout` otherwise.
+   */
   private async runWaitUntil(item: JsonObject, context?: ToolInvocationContext): Promise<JsonObject> {
     const code = this.codeWithArgs(item);
-    // timeout_ms bounds the whole wait; each poll keeps the default eval deadline.
+    // timeout_ms bounds the whole wait; each poll keeps the default eval
+    // deadline and is also raced against the time the wait has left.
     const { timeout_ms: _waitTimeout, ...probe } = item;
     const target = item.target === undefined ? 'edit' : requiredString(item.target, 'target');
     const timeoutMs = numberField(item.timeout_ms, 'timeout_ms', { integer: true, min: 1, max: 300_000 }) ?? 30_000;
@@ -1457,18 +1532,39 @@ return {passed=#failures==0,failures=failures}`;
     let stableFrames = 0;
     let lastEvaluation: JsonObject | undefined;
     let lastError: string | undefined;
+    let lastAbandoned = false;
+    let sleptMs = 0;
+    /**
+     * Wall time an await took beyond what its own timers allow is time the
+     * process did not run: the host was asleep (or the daemon was stopped).
+     */
+    const bounded = async <T>(boundMs: number, work: Promise<T>): Promise<T> => {
+      const began = Date.now();
+      try { return await work; }
+      finally {
+        const over = Date.now() - began - boundMs;
+        if (over > HOST_SLEEP_SLACK_MS) sleptMs += over;
+      }
+    };
 
     while (Date.now() <= deadline && !context?.job?.cancelled()) {
       attempts += 1;
+      const pollDeadline = Math.max(deadline, Date.now() + WAIT_UNTIL_MIN_EVALUATION_MS);
+      const expiry = wallClockDeadline(pollDeadline);
+      const abandon = poll ? AbortSignal.any([poll.signal, expiry.signal]) : expiry.signal;
       try {
         const evaluationContext = poll?.requestId
           ? { ...poll, requestId: childRequestId(`${poll.requestId}:poll`, attempts) }
           : poll;
-        const evaluation = asObject(await this.evaluate({ ...probe, code, target }, evaluationContext));
-        lastEvaluation = evaluation;
+        const evaluation = this.evaluate({ ...probe, code, target }, evaluationContext, abandon);
+        const answer = asObject(await bounded(
+          Math.min(pollDeadline - Date.now(), WAIT_UNTIL_EVALUATION_TIMEOUT_MS),
+          Promise.race([evaluation, abandoned(abandon)]),
+        ));
+        lastEvaluation = answer;
         lastError = undefined;
-        const value = Array.isArray(evaluation.results) ? evaluation.results[0] : evaluation.result;
-        const condition = value !== undefined && value !== null && !assertionFailed(evaluation);
+        const value = Array.isArray(answer.results) ? answer.results[0] : answer.result;
+        const condition = value !== undefined && value !== null && !assertionFailed(answer);
         if (!condition) {
           stableFrames = 0;
         } else {
@@ -1492,32 +1588,67 @@ return {passed=#failures==0,failures=failures}`;
         // A cancelled poll is a read-only probe abandoned on purpose.
         if (context?.job?.cancelled()) break;
         if (context?.signal.aborted) throw error;
+        if (expiry.signal.aborted) {
+          lastAbandoned = true;
+          stableFrames = 0;
+          break;
+        }
         if (!(error instanceof CliCommandError) || error.code !== 'evaluation_failed') throw error;
         stableFrames = 0;
         lastError = error.message;
+      } finally {
+        expiry.dispose();
       }
 
       const remainingMs = deadline - Date.now();
       if (remainingMs <= 0) break;
-      try { await waitFor(Math.min(Number(item.interval_ms ?? WAIT_UNTIL_POLL_MS), remainingMs), poll?.signal); }
+      const pauseMs = Math.min(Number(item.interval_ms ?? WAIT_UNTIL_POLL_MS), remainingMs);
+      try { await bounded(pauseMs, waitFor(pauseMs, poll?.signal)); }
       catch (error) { if (!context?.job?.cancelled()) throw error; }
     }
 
     const cancelledWait = context?.job?.cancelled() === true;
+    const elapsedMs = Date.now() - startedAt;
+    // Why it timed out, from one cheap render-health read taken only on failure.
+    const stall = cancelledWait ? undefined : await this.renderStall(item, poll?.signal);
+    const warnings = [
+      ...(sleptMs > 0 ? [`The Mac slept for at least ${Math.round(sleptMs / 1000)} s during this wait (lid closed or system sleep); Studio and the daemon were suspended, so the deadline passed while it slept.`] : []),
+      ...(stall ? [RENDER_STALLED_WARNING] : []),
+    ];
     return {
       passed: false,
       condition: false,
       timed_out: !cancelledWait,
-      ...(cancelledWait ? { cancelled: true } : {}),
+      ...(cancelledWait ? { cancelled: true } : { code: sleptMs > 0 ? 'host_slept' : stall ? 'render_stalled' : 'timeout' }),
       target,
       stable_samples: stableFrames,
       stable_frames: stableFrames,
       required_stable_frames: requiredStableFrames,
       attempts,
-      elapsed_ms: Date.now() - startedAt,
+      elapsed_ms: elapsedMs,
+      last_evaluation_abandoned: lastAbandoned,
+      ...(sleptMs > 0 ? { host_slept_ms: sleptMs } : {}),
+      ...(stall ? { render: stall } : {}),
+      ...(warnings.length ? { warnings } : {}),
       ...(lastEvaluation === undefined ? {} : { evaluation: lastEvaluation }),
       ...(lastError === undefined ? {} : { last_error: lastError }),
     };
+  }
+
+  /**
+   * The visible view's render state when it has stopped rendering; undefined
+   * when it renders or cannot be read. Best-effort: a diagnosis, never a
+   * reason for the caller's own failure.
+   */
+  private async renderStall(body: JsonObject, signal?: AbortSignal): Promise<JsonObject | undefined> {
+    try {
+      const instanceId = this.sessions.require(body).instance_id;
+      const sample = renderSample(asObject(await this.tools.getRuntimeHealth(instanceId, undefined, false, undefined, signal, false)).peers);
+      if (!sample?.stalled) return undefined;
+      return { role: sample.role, rendering: false, ...(sample.seconds_since_frame === undefined ? {} : { seconds_since_frame: sample.seconds_since_frame }) };
+    } catch {
+      return undefined;
+    }
   }
 
   /** Roles of the runtime peers (play server and clients) connected in an instance's scope. */

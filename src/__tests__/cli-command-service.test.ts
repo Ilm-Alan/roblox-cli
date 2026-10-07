@@ -21,6 +21,7 @@ import { publicRequestStatus, publicToolErrorBody } from '../command-results.js'
 import { CLI_COMMANDS } from '../commands.js';
 import { createHttpServer } from '../http-server.js';
 import { RobloxStudioTools } from '../tools/index.js';
+import { RENDER_STALLED_WARNING } from '../render-rate.js';
 
 function parseResult(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('expected an object command result');
@@ -503,6 +504,45 @@ describe('roblox-cli command contract', () => {
     const result = await service.test({ action: 'play', duration_ms: 0 }) as Record<string, unknown>;
     expect(result.render_fps).toBe(15);
     expect(result.warnings).toEqual(['Studio renders at ~15 fps while it is not the frontmost window; pass --foreground for a full-rate video.']);
+  });
+
+  test('a view that stopped rendering is reported plainly but does not fail a run that never depended on it', async () => {
+    const bridge = new BridgeService();
+    registerEdit(bridge);
+    registerPeer(bridge, 'client-1');
+    const tools = new RobloxStudioTools(bridge);
+    jest.spyOn(tools, 'soloPlaytest').mockResolvedValue({ success: true } as never);
+    const client = (frames: number, at: number, rendering: boolean) => ({ peers: { 'client-1': { role: 'client-1', render: { available: true, rendering, state: rendering ? 'rendering' : 'stale', frame_count: frames, sampled_at: at } } } });
+    jest.spyOn(tools, 'getRuntimeHealth')
+      .mockResolvedValueOnce(client(100, 10, true) as never)
+      .mockResolvedValueOnce(client(150, 20, false) as never);
+    const service = new CliCommandService(tools, bridge);
+    jest.spyOn(service, 'logs').mockResolvedValue({ entries: [] });
+    await service.open({ source: 'attach' });
+    const result = await service.test({ action: 'play', duration_ms: 0 }) as Record<string, unknown>;
+    expect(result).toMatchObject({ passed: true, render_fps: 5, warnings: [RENDER_STALLED_WARNING] });
+    expect(result).not.toHaveProperty('suspicious');
+  });
+
+  test('a readiness wait that times out while Studio is not rendering fails as render_stalled', async () => {
+    const bridge = new BridgeService();
+    registerEdit(bridge);
+    registerPeer(bridge, 'client-1');
+    const tools = new RobloxStudioTools(bridge);
+    jest.spyOn(tools, 'soloPlaytest').mockResolvedValue({ success: true } as never);
+    jest.spyOn(tools, 'getRuntimeHealth').mockResolvedValue({ peers: { 'client-1': { role: 'client-1', render: { available: true, rendering: false, state: 'stale', seconds_since_frame: 9, frame_count: 5, sampled_at: 1 } } } } as never);
+    const service = new CliCommandService(tools, bridge);
+    jest.spyOn(service, 'logs').mockResolvedValue({ entries: [] });
+    jest.spyOn(service, 'screenshot').mockResolvedValue({ width: 2, height: 2 });
+    jest.spyOn(service, 'evaluate').mockResolvedValue({ result: false });
+    await service.open({ source: 'attach' });
+    const failed = await service.test({ action: 'play', keep_open: true, timeout: 1, readiness_attribute: 'GameReady' });
+    expect(failed).toMatchObject({
+      passed: false,
+      failure: { code: 'playtest_failed', reason: 'render_stalled' },
+      evidence: { readiness: { passed: false, timed_out: true, code: 'render_stalled', last_evaluation_abandoned: false } },
+      warnings: [RENDER_STALLED_WARNING],
+    });
   });
 
   test('readiness must become true before a playtest can pass', async () => {
@@ -1359,5 +1399,111 @@ describe('teardown stops the playtest and proves it', () => {
     const result = service.jobs.result('long-wait') as Record<string, unknown>;
     expect(result).toMatchObject({ passed: false, cancelled: true, cleanup: { runtime: 'stopped' }, steps: [{ passed: false, result: { cancelled: true } }] });
     expect(lifecycle.mock.calls.map(call => call[0])).toContain('stop');
+  });
+});
+
+describe('wait_until honours its deadline and says why it failed', () => {
+  const previousHome = process.env.ROBLOX_CLI_HOME;
+  let testHome: string;
+
+  beforeEach(() => {
+    testHome = mkdtempSync(`${tmpdir()}/roblox-cli-deadline-`);
+    process.env.ROBLOX_CLI_HOME = testHome;
+    jest.useFakeTimers();
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+    jest.restoreAllMocks();
+    if (previousHome === undefined) delete process.env.ROBLOX_CLI_HOME;
+    else process.env.ROBLOX_CLI_HOME = previousHome;
+    rmSync(testHome, { recursive: true, force: true });
+  });
+
+  const clientHealth = (render: Record<string, unknown>) => ({ peers: { 'client-1': { role: 'client-1', render: { available: true, frame_count: 575, sampled_at: 100, ...render } } } });
+  const rendering = clientHealth({ rendering: true, state: 'rendering', seconds_since_frame: 0.02 });
+  const stale = clientHealth({ rendering: false, state: 'stale', seconds_since_frame: 8.64 });
+  const answer = { bridge: 'ok', ok: true, values: [true], valueTypes: ['boolean'], output: [] };
+
+  async function fixture(health: unknown) {
+    const bridge = new BridgeService();
+    registerEdit(bridge);
+    const client = registerPeer(bridge, 'client-1');
+    const tools = new RobloxStudioTools(bridge);
+    jest.spyOn(tools, 'getRuntimeHealth').mockResolvedValue(health as never);
+    const service = new CliCommandService(tools, bridge);
+    await service.open({ source: 'attach' });
+    // runScenarioStep is private; the test drives one step as a job would.
+    const runner = service as unknown as {
+      runScenarioStep(step: unknown, context: { signal: AbortSignal; requestId: string }): Promise<unknown>;
+    };
+    const step = (item: Record<string, unknown>, requestId: string) => runner.runScenarioStep(
+      { type: 'wait_until', target: 'client-1', instance_id: 'instance:test', ...item },
+      { signal: new AbortController().signal, requestId },
+    );
+    /** Claim the poll Studio would be running; it is never answered unless the test answers it. */
+    const claim = async () => {
+      await jest.advanceTimersByTimeAsync(0);
+      const request = bridge.claimNextRequestForTransport(client, client);
+      if (!request) throw new Error('expected a queued poll');
+      return request;
+    };
+    return { bridge, step, claim };
+  }
+
+  test('a poll that stalls past the deadline is abandoned at the deadline, not after it', async () => {
+    const { bridge, step, claim } = await fixture(rendering);
+    const pending = step({ code: 'return false', timeout_ms: 5_000 }, 'stalled-poll');
+    const stalled = await claim();
+    expect(stalled.endpoint).toBe('/api/eval-runtime');
+    await jest.advanceTimersByTimeAsync(5_000);
+    const result = parseResult(await pending);
+    expect(result).toMatchObject({ passed: false, timed_out: true, code: 'timeout', attempts: 1, last_evaluation_abandoned: true, elapsed_ms: 5_000 });
+    expect(result).not.toHaveProperty('warnings');
+    // The bridge waiter ended and Studio was told to drop the poll: nothing is left queued for later steps.
+    expect(bridge.getRequestStatus(stalled.requestId)).toMatchObject({ state: 'aborted' });
+    expect(bridge.getPendingRequestCount()).toBe(0);
+
+    const next = step({ code: 'return true', timeout_ms: 2_000 }, 'after-stall');
+    bridge.resolveRequest((await claim()).requestId, answer);
+    expect(parseResult(await next)).toMatchObject({ passed: true, attempts: 1 });
+  });
+
+  test('a poll started just before the deadline still gets a short floor to answer', async () => {
+    const { bridge, step, claim } = await fixture(rendering);
+    const pending = step({ code: 'return true', timeout_ms: 1 }, 'floor');
+    const request = await claim();
+    await jest.advanceTimersByTimeAsync(200);
+    bridge.resolveRequest(request.requestId, answer);
+    expect(parseResult(await pending)).toMatchObject({ passed: true, attempts: 1 });
+  });
+
+  test('a wait that times out while Studio is not rendering is reported as render_stalled', async () => {
+    const { step, claim } = await fixture(stale);
+    const pending = step({ code: 'return false', timeout_ms: 3_000 }, 'starved');
+    await claim();
+    await jest.advanceTimersByTimeAsync(3_000);
+    expect(parseResult(await pending)).toMatchObject({
+      passed: false, timed_out: true, code: 'render_stalled', last_evaluation_abandoned: true,
+      render: { role: 'client-1', rendering: false, seconds_since_frame: 8.6 },
+      warnings: [RENDER_STALLED_WARNING],
+    });
+  });
+
+  test('a Mac that slept through the deadline ends the wait within a second of waking and says so', async () => {
+    const { step, claim } = await fixture(stale);
+    const pending = step({ code: 'return false', timeout_ms: 120_000 }, 'slept');
+    await claim();
+    // System sleep: the wall clock jumps 17 minutes while no timer runs.
+    jest.setSystemTime(Date.now() + 1_020_000);
+    await jest.advanceTimersByTimeAsync(1_000);
+    const result = parseResult(await pending);
+    expect(result).toMatchObject({ passed: false, timed_out: true, code: 'host_slept', attempts: 1, last_evaluation_abandoned: true, elapsed_ms: 1_021_000 });
+    // A lower bound: the suspended await is credited with the most its own timers allow (30 s).
+    expect(result.host_slept_ms).toBe(1_021_000 - 30_000);
+    expect(result.warnings).toEqual([
+      'The Mac slept for at least 991 s during this wait (lid closed or system sleep); Studio and the daemon were suspended, so the deadline passed while it slept.',
+      RENDER_STALLED_WARNING,
+    ]);
   });
 });

@@ -340,10 +340,10 @@ const COMMAND_SPECS: Record<(typeof AGENT_COMMAND_NAMES)[number], JsonObject> = 
         in_flight: { type: 'object' },
         mode: { type: 'string' },
         result: {},
-        failure: { type: 'object' },
+        failure: { type: 'object', description: 'code, message, and for a run stopped by a timed-out wait whose cause is known, reason: render_stalled or host_slept.' },
         suspicious: { type: 'boolean' },
         render_fps: { type: 'number', description: 'play: frames per second the visible Studio view (client-1, else edit) actually rendered during the run, measured by the plugin. Also on the recording receipt.' },
-        warnings: { type: 'array', items: { type: 'string' }, description: 'play: scenario warnings, plus a warning when render_fps is below 25 (Studio throttles a window that is not frontmost; pass --foreground for a full-rate video).' },
+        warnings: { type: 'array', items: { type: 'string' }, description: 'play: scenario warnings, plus a warning when render_fps is below 25 (Studio throttles a window that is not frontmost; pass --foreground for a full-rate video), when Studio stopped rendering (display asleep or window minimized), or when the Mac slept during a wait.' },
         evidence_directory: { type: 'string' },
         runtime_health: { type: 'object' },
         solo_outcome: {
