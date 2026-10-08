@@ -93,6 +93,22 @@ async function answered<T>(work: Promise<T>, bridge: BridgeService, peerId: stri
   return work;
 }
 
+// Registering a fake Studio peer starts a background lookup in the managed
+// instance registry that can still be running when a test ends. Kept inside a
+// per-test ROBLOX_CLI_HOME, it re-created `managed-instances` while that home
+// was being removed (ENOTEMPTY on Windows). One registry for the whole file,
+// removed after every test has finished, keeps teardown out of its way.
+const previousRegistry = process.env.ROBLOX_CLI_MANAGED_INSTANCE_REGISTRY_DIR;
+const registryHome = mkdtempSync(`${tmpdir()}/roblox-cli-registry-`);
+beforeAll(() => {
+  process.env.ROBLOX_CLI_MANAGED_INSTANCE_REGISTRY_DIR = join(registryHome, 'v1');
+});
+afterAll(async () => {
+  if (previousRegistry === undefined) delete process.env.ROBLOX_CLI_MANAGED_INSTANCE_REGISTRY_DIR;
+  else process.env.ROBLOX_CLI_MANAGED_INSTANCE_REGISTRY_DIR = previousRegistry;
+  await removeHome(registryHome);
+});
+
 describe('roblox-cli command contract', () => {
   const previousHome = process.env.ROBLOX_CLI_HOME;
   let testHome: string;
