@@ -42,7 +42,9 @@ jobs:
       - run: npm --prefix studio-plugin ci --ignore-scripts
       - run: npm run build
       - run: npm run check:package
-      - run: npm --prefix studio-plugin audit
+      # Shipped dependencies only, like the CLI's own audit: the roblox-ts
+      # compiler's watcher pulls `braces`, which has no patched release.
+      - run: npm --prefix studio-plugin audit --omit=dev
 
   windows:
     runs-on: windows-latest

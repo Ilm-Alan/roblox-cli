@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync } from 'node:fs';
+import { removeHome } from './remove-home.js';
 import { tmpdir } from 'node:os';
 import { TestJobs, childRequestId } from '../test-jobs.js';
 import { compileScenario, type Json } from '../scenario.js';
@@ -23,7 +24,7 @@ describe('persistent native scenario jobs', () => {
   });
   let home: string;
   beforeEach(() => { home = mkdtempSync(`${tmpdir()}/roblox-jobs-test-`); });
-  afterEach(() => { rmSync(home, { recursive: true, force: true }); });
+  afterEach(async () => { await removeHome(home); });
   test('admission is durable before work starts; complete receipts survive daemon replacement without a size cap', async () => {
     let mutations = 0;
     const deps = {
